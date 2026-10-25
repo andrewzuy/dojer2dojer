@@ -1,0 +1,22 @@
+# p2p-tunnel configuration
+
+# STUN servers to try, in order.
+stun_servers = [
+    "stun.l.google.com:19302",
+    "stun1.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+]
+
+# Milliseconds between outbound hole-punch packets.
+punch_interval_ms = 500
+
+# Seconds to keep trying to hole-punch before giving up.
+punch_timeout_secs = 30
+
+# Client side: local TCP port to listen on and forward through the tunnel.
+# Uncomment on the machine that exposes a local service port.
+# local_tcp_listen_port = 12345
+
+# Server side: where to forward incoming tunneled TCP traffic.
+# Uncomment on the machine that holds the target service.
+# remote_target_addr = "192.168.1.50:22"
