@@ -209,7 +209,10 @@ pub async fn accept(endpoint: &quinn::Endpoint) -> anyhow::Result<quinn::Connect
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+
+    // NOTE: no loopback QUIC test (server + client on localhost) — by
+    // project decision the real handshake is verified in Phase 12 between
+    // two real machines on different networks.
 
     #[test]
     fn generates_cert_and_key() {
@@ -239,57 +242,5 @@ mod tests {
         let (certs, key) = generate_self_signed_cert().unwrap();
         build_client_config().expect("client config builds");
         build_server_config(certs, key).expect("server config builds");
-    }
-
-    /// Full loopback test: our generated cert + accept-any verifier +
-    /// endpoint creation all work together on a real QUIC handshake,
-    /// with data flowing over a bidirectional stream.
-    #[tokio::test]
-    async fn loopback_quic_handshake_and_stream_echo() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "info".into()),
-            )
-            .try_init();
-        let result = tokio::time::timeout(Duration::from_secs(5), async {
-            // --- server side ---
-            let (certs, key) = generate_self_signed_cert().unwrap();
-            let server_config = build_server_config(certs, key).unwrap();
-            let server_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let server_addr: SocketAddr = server_socket.local_addr().unwrap();
-            let server = create_endpoint(server_socket, Some(server_config)).unwrap();
-
-            let server_task = tokio::spawn(async move {
-                let connection = accept(&server).await.unwrap();
-                let (mut send, mut recv) = connection.open_bi().await.unwrap();
-                let data = recv.read_to_end(4096).await.unwrap();
-                // Echo back, so the client can verify the round trip.
-                send.write_all(&data).await.unwrap();
-                send.finish().unwrap();
-            });
-
-            // --- client side ---
-            let client_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let mut client = create_endpoint(client_socket, None).unwrap();
-            client.set_default_client_config(build_client_config().unwrap());
-
-            let connection = connect(&client, server_addr).await.unwrap();
-            let (mut send, mut recv) = connection.open_bi().await.unwrap();
-            send.write_all(b"ping over the tunnel").await.unwrap();
-            send.finish().unwrap();
-            let data = recv.read_to_end(4096).await.unwrap();
-            assert_eq!(data, b"ping over the tunnel");
-
-            server_task.await.unwrap();
-            Ok::<(), anyhow::Error>(())
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => panic!("loopback QUIC test failed: {e:#}"),
-            Err(_) => panic!("loopback QUIC test timed out (handshake or stream stuck)"),
-        }
     }
 }
