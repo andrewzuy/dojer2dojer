@@ -78,6 +78,26 @@ then update this file. Implement phases self-contained from plan.md + this file 
   localhost (conflicts/ambiguity on one machine); the real handshake is verified
   in Phase 12 between two real machines on different networks.
 
+### Phase 8 — Client Bridge (TCP→QUIC) ✅
+- `tunnel::run_client_side(conn: quinn::Connection, listen_port: u16)`:
+  binds `127.0.0.1:<port>` (loopback only); per accepted TCP conn → spawn a
+  bridge task on a fresh `conn.open_bi()` stream; exits when the QUIC
+  connection closes (`conn.closed()`).
+- `tunnel::bridge_stream(conn, tcp)`: `open_bi()` + `tcp.into_split()` +
+  `bridge_halves(tcp_read, send, recv, tcp_write)` → `(bytes_up, bytes_down)`.
+- `tunnel::bridge_halves(read_a, write_a, read_b, write_b)` — the reusable copy
+  core: two spawned tasks, each `tokio::io::copy` until EOF then `shutdown()`
+  of its write half; resolves only when BOTH directions are done.
+  **Half-close propagates** (EOF on one side does not kill the other direction —
+  e.g. app finishes write side, remote replies keep flowing).
+  Generic over `AsyncRead/AsyncWrite + Unpin + Send`, so it is unit-tested with
+  in-memory `tokio::io::duplex` pairs — no loopback QUIC (per the decision above).
+- 2 new tests: both-ways byte flow with exact counts; half-close propagation
+  while the other direction keeps flowing. 24 tests total.
+- Note: tokio 1.54 `TcpStream::into_split` is SYNC (returns owned halves, not a
+  future) and `SendStream::finish(&mut self)` / `AsyncWrite::shutdown` send the QUIC FIN.
+- main.rs untouched — wiring is Phase 10 (hence the expected dead_code warnings).
+
 ## Current API surface
 - `config::Config{...}`, `Config::load(&Path)`
 - `cli::Cli{config}`, `Cli::parse()`, `cli::prompt_peer_addr()`, `cli::parse_peer_addr(&str)`
@@ -86,13 +106,9 @@ then update this file. Implement phases self-contained from plan.md + this file 
 - `role::{Role, determine_role}`
 - `quic::{CERT_CN, generate_self_signed_cert, fingerprint, build_client_config, build_server_config,
   create_endpoint, connect, accept}`
-- `tunnel::{run_client_side, run_server_side}` — TODO stubs (Phases 8/9)
+- `tunnel::{run_client_side, bridge_halves}` — Phase 8 done; `run_server_side` still TODO (Phase 9)
 
-## Next: Phases 8, 9, 10
-Phase 8 — Client bridge (tunnel.rs `run_client_side`): bind TCP listener on
-`cfg.local_tcp_listen_port`; per accepted TCP conn → `conn.open_bi()`; two copy
-tasks (TCP→QUIC, QUIC→TCP) via `tokio::io::copy`; close both ends when either side
-finishes/errors.
+## Next: Phases 9, 10
 Phase 9 — Server bridge (tunnel.rs `run_server_side`): loop on `conn.accept_bi()`;
 per stream → `TcpStream::connect(cfg.remote_target_addr)`; same mirrored copy
 pattern; spawn a task per stream for concurrency.
@@ -111,5 +127,10 @@ QUIC handshake validation).
 - User-facing text: `println!` (stdout); diagnostics: `tracing`.
 - No loopback (same-machine) tests for the QUIC server+client path; real handshake
   validated in Phase 12 on two real machines. Loopback is fine for non-QUIC units
-  (STUN parse, punch logic).
+  (STUN parse, punch logic). Bridge logic is tested via in-memory duplex streams
+  instead (`tunnel::bridge_halves` is generic on purpose).
+- Tunnel half-close semantics: EOF in one direction shuts down only that
+  direction's write side; the other direction keeps flowing until its own EOF.
+  (Two independent copy tasks, not a `select!` that kills both on first EOF —
+  first-EOF-would-kill would break e.g. `echo x | ssh host cat`.)
 - Phase 10 flow: config → STUN → print addr → prompt peer → punch → role → certs → QUIC → tunnel.

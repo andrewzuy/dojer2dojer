@@ -75,14 +75,15 @@ work.
 | 5 | Deterministic role negotiation | ✅ |
 | 6 | Runtime self-signed cert + accept-any verifier | ✅ |
 | 7 | QUIC endpoint on the punched socket | ✅ |
-| 8 | TCP→QUIC bridge (client side) | ⏳ next |
-| 9 | QUIC→TCP bridge (server side) | ⏳ |
+| 8 | TCP→QUIC bridge (client side) | ✅ |
+| 9 | QUIC→TCP bridge (server side) | ⏳ next |
 | 10 | Full `main.rs` wiring, end-to-end | ⏳ |
 | 11 | Logging & diagnostics polish | ⏳ |
 | 12 | Real-world two-machine NAT testing | ⏳ |
 
-**22 unit tests pass** (`cargo test`): STUN encode/parse, punch timing/
-filtering, role symmetry, cert/fingerprint/config construction.
+**24 unit tests pass** (`cargo test`): STUN encode/parse, punch timing/
+filtering, role symmetry, cert/fingerprint/config construction, and the
+tunnel bridge's copy/half-close semantics (tested with in-memory streams).
 Per project decision there is deliberately **no loopback test of the QUIC
 server+client path** (one machine playing both roles); the real handshake is
 validated in Phase 12 between two machines on different networks.
