@@ -96,28 +96,61 @@ then update this file. Implement phases self-contained from plan.md + this file 
   while the other direction keeps flowing. 24 tests total.
 - Note: tokio 1.54 `TcpStream::into_split` is SYNC (returns owned halves, not a
   future) and `SendStream::finish(&mut self)` / `AsyncWrite::shutdown` send the QUIC FIN.
-- main.rs untouched — wiring is Phase 10 (hence the expected dead_code warnings).
+- main.rs untouched — wiring is Phase 10 (hence the expected dead_code warnings at the time).
+
+### Phase 9 — Server Bridge (QUIC→TCP) ✅
+- `tunnel::run_server_side(conn: quinn::Connection, target_addr: SocketAddr)`:
+  loop on `tokio::select!` over `conn.accept_bi()` / `conn.closed()`; each
+  accepted stream spawns its own task → `TcpStream::connect(target_addr)` →
+  `bridge_quic_tcp(send, recv, tcp)`. Concurrent tunneled sessions are
+  independent tasks (N streams ↔ N TCP conns).
+- `tunnel::bridge_quic_tcp(send, recv, tcp)`: the shared byte-bridge core
+  (refactored out of Phase 8's `bridge_stream`): `tcp.into_split()` +
+  `bridge_halves(tcp_read, send, recv, tcp_write)` → `(bytes_up, bytes_down)`.
+- Unreachable target: warn + `send.finish()` (FIN) so the client sees EOF
+  instead of hanging.
+- Quinn 0.11 notes: `Connection::accept_bi()` returns
+  `Result<(SendStream, RecvStream), ConnectionError>` (NO Option wrapper);
+  `SendStream::finish(&mut self)` is SYNC (`Result<(), ClosedStream>`).
+
+### Phase 10 — Full main wiring ✅
+- `main.rs` after endpoint creation: `Role::Server` → parse
+  `cfg.remote_target_addr` (clear error when missing/invalid) →
+  `quic::accept` → `run_server_side`. `Role::Client` →
+  `cfg.local_tcp_listen_port` (clear error when missing) → `quic::connect` →
+  `run_client_side`. Binary now runs the complete end-to-end tunnel.
+
+### Phase 11 — Logging + diagnostics polish ✅
+- `--verbose` CLI flag (debug logging; RUST_LOG still wins if set).
+- Structured `main()` (logging init + error rendering) / `run()` (flow) split.
+- tracing spans: `stun`, `punch`, `quic_handshake`, `tunnel{role}`.
+- `hint_for(&Error)`: actionable hint for common failure modes —
+  "STUN discovery failed" (connectivity / CGNAT), "hole punching timed out"
+  (stale address / symmetric NAT), "QUIC handshake" (middlebox / peer exit),
+  "is required for the" (missing config option).
+- Failures print `error: {e:#}` (+hint) to stderr and `process::exit(1)`.
 
 ## Current API surface
 - `config::Config{...}`, `Config::load(&Path)`
-- `cli::Cli{config}`, `Cli::parse()`, `cli::prompt_peer_addr()`, `cli::parse_peer_addr(&str)`
+- `cli::Cli{config, verbose}`, `Cli::parse()`, `cli::prompt_peer_addr()`, `cli::parse_peer_addr(&str)`
 - `stun::{encode_binding_request, parse_binding_response, discover_public_addr, StunError, STUN_MAGIC_COOKIE}`
 - `punch::punch(&UdpSocket, SocketAddr, &Config)`
 - `role::{Role, determine_role}`
 - `quic::{CERT_CN, generate_self_signed_cert, fingerprint, build_client_config, build_server_config,
   create_endpoint, connect, accept}`
-- `tunnel::{run_client_side, bridge_halves}` — Phase 8 done; `run_server_side` still TODO (Phase 9)
+- `tunnel::{run_client_side, run_server_side, bridge_halves}` — all phases 8–10 wired in main.
 
-## Next: Phases 9, 10
-Phase 9 — Server bridge (tunnel.rs `run_server_side`): loop on `conn.accept_bi()`;
-per stream → `TcpStream::connect(cfg.remote_target_addr)`; same mirrored copy
-pattern; spawn a task per stream for concurrency.
-Phase 10 — Wire into main.rs: after endpoint creation, `Role::Server` →
-`quic::accept` then `run_server_side`; `Role::Client` → `quic::connect` then
-`run_client_side`. Parse `cfg.remote_target_addr` (server role) and
-`cfg.local_tcp_listen_port` (client role) with clear errors when missing. Then
-Phase 11 (logging polish) + Phase 12 (real two-machine NAT test — first real
-QUIC handshake validation).
+## Next: Phase 12 — real two-machine NAT test (first real QUIC handshake validation)
+1. Machine A (e.g. this box): server config (`remote_target_addr` = a private
+   service, e.g. `127.0.0.1:2222` running a local `ssh -p 2222` listener or a
+   test TCP echo server).
+2. Machine B: client config (`local_tcp_listen_port`), then
+   `ssh -p <port> user@127.0.0.1` from B should land on A's target.
+3. Verify: STUN addrs exchanged → punch success on both sides → QUIC handshake
+   (compare cert fingerprints) → bytes flow both ways → clean shutdown.
+4. Local simulation option (no second machine): two network namespaces +
+   `iptables` MASQUERADE to fake a NAT — available tools on this box:
+   `sudo`, `ip`, `iptables`, `nft`, `python3` (uid 1000, in `wheel`).
 
 ## Standing decisions
 - Errors: `anyhow` at boundaries, `thiserror` for module-level errors (StunError).
