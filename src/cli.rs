@@ -54,8 +54,14 @@ mod tests {
 
     #[test]
     fn parses_valid_addrs() {
-        assert_eq!(parse_peer_addr("1.2.3.4:1234").unwrap(), "1.2.3.4:1234".parse().unwrap());
-        assert_eq!(parse_peer_addr(" [2001:db8::1]:443 ").unwrap(), "[2001:db8::1]:443".parse().unwrap());
+        assert_eq!(
+            parse_peer_addr("1.2.3.4:1234").unwrap(),
+            "1.2.3.4:1234".parse().unwrap()
+        );
+        assert_eq!(
+            parse_peer_addr(" [2001:db8::1]:443 ").unwrap(),
+            "[2001:db8::1]:443".parse().unwrap()
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use clap::Parser;
-use tracing::{info, Instrument};
+use tracing::{Instrument, info};
 
 #[tokio::main]
 async fn main() {
@@ -96,13 +96,9 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
                 .context(
                     "config: `remote_target_addr` is required for the server role \n                     (the private ip:port to forward tunneled TCP to)",
                 )?;
-            let target: SocketAddr = target
-                .parse()
-                .with_context(|| {
-                    format!(
-                        "config: `remote_target_addr` = {target:?} is not a valid ip:port"
-                    )
-                })?;
+            let target: SocketAddr = target.parse().with_context(|| {
+                format!("config: `remote_target_addr` = {target:?} is not a valid ip:port")
+            })?;
             info!("waiting for the peer's QUIC connection…");
             let conn = quic::accept(&endpoint)
                 .instrument(tracing::info_span!("quic_handshake"))

@@ -48,7 +48,11 @@ pub fn determine_role(own: SocketAddr, peer: SocketAddr) -> Role {
     if own_key == peer_key {
         // Same IP — only possible in local tests; use the port. A perfect tie
         // (same ip:port) cannot happen between two real peers.
-        return if own.port() <= peer.port() { Role::Server } else { Role::Client };
+        return if own.port() <= peer.port() {
+            Role::Server
+        } else {
+            Role::Client
+        };
     }
     if own_key < peer_key {
         Role::Server
@@ -102,7 +106,9 @@ mod tests {
     #[test]
     fn v4_always_beats_v6() {
         let v4 = "1.2.3.4:1".parse::<SocketAddr>().unwrap();
-        let v6 = "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:1".parse::<SocketAddr>().unwrap();
+        let v6 = "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:1"
+            .parse::<SocketAddr>()
+            .unwrap();
         assert_eq!(determine_role(v4, v6), Role::Server);
         assert_eq!(determine_role(v6, v4), Role::Client);
     }

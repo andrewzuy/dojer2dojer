@@ -54,7 +54,10 @@ pub fn encode_binding_request(transaction_id: &[u8; 12]) -> [u8; 20] {
 ///
 /// Validates message type, magic cookie, transaction ID, then extracts
 /// XOR-MAPPED-ADDRESS (falling back to plain MAPPED-ADDRESS).
-pub fn parse_binding_response(data: &[u8], expected_txn: &[u8; 12]) -> Result<SocketAddr, StunError> {
+pub fn parse_binding_response(
+    data: &[u8],
+    expected_txn: &[u8; 12],
+) -> Result<SocketAddr, StunError> {
     let unknown = "<unknown>";
     if data.len() < 20 {
         return Err(StunError::Malformed {
@@ -79,7 +82,10 @@ pub fn parse_binding_response(data: &[u8], expected_txn: &[u8; 12]) -> Result<So
     if data.len() < 20 + msg_len {
         return Err(StunError::Malformed {
             server: unknown.into(),
-            reason: format!("truncated: header says {msg_len} attr bytes, got {}", data.len() - 20),
+            reason: format!(
+                "truncated: header says {msg_len} attr bytes, got {}",
+                data.len() - 20
+            ),
         });
     }
     if u32::from_be_bytes([data[4], data[5], data[6], data[7]]) != STUN_MAGIC_COOKIE {
@@ -154,7 +160,10 @@ fn xor_mapped_address(value: &[u8], txn: &[u8; 12]) -> Option<SocketAddr> {
     // XORed with the 32-bit cookie (v4) or the 16-byte key cookie||txn (v6).
     match value[1] {
         0x01 => Some(SocketAddr::new(
-            std::net::Ipv4Addr::from(u32::from_be_bytes(value[4..8].try_into().ok()?) ^ STUN_MAGIC_COOKIE).into(),
+            std::net::Ipv4Addr::from(
+                u32::from_be_bytes(value[4..8].try_into().ok()?) ^ STUN_MAGIC_COOKIE,
+            )
+            .into(),
             u16::from_be_bytes([value[2], value[3]]) ^ (STUN_MAGIC_COOKIE >> 16) as u16,
         )),
         0x02 => {
@@ -203,7 +212,11 @@ pub async fn discover_public_addr(
             };
             for server_addr in addrs {
                 debug!(%server_addr, round, "sending STUN binding request");
-                match tokio::time::timeout(PER_ATTEMPT_TIMEOUT, send_and_wait(socket, server_addr, &req, &txn)).await
+                match tokio::time::timeout(
+                    PER_ATTEMPT_TIMEOUT,
+                    send_and_wait(socket, server_addr, &req, &txn),
+                )
+                .await
                 {
                     Ok(Ok(public_addr)) => {
                         debug!(%server_addr, "STUN response received");
@@ -215,7 +228,10 @@ pub async fn discover_public_addr(
                     }
                     Err(_) => {
                         warn!(%server_addr, timeout_secs = PER_ATTEMPT_TIMEOUT.as_secs(), "STUN server timed out");
-                        last_err = Some(format!("{server_addr}: timed out after {}s", PER_ATTEMPT_TIMEOUT.as_secs()));
+                        last_err = Some(format!(
+                            "{server_addr}: timed out after {}s",
+                            PER_ATTEMPT_TIMEOUT.as_secs()
+                        ));
                     }
                 }
             }
@@ -223,7 +239,9 @@ pub async fn discover_public_addr(
     }
 
     let last = last_err.unwrap_or_else(|| "no STUN servers configured".into());
-    Err(anyhow::anyhow!("STUN discovery failed: {last} (tried servers: {servers:?})"))
+    Err(anyhow::anyhow!(
+        "STUN discovery failed: {last} (tried servers: {servers:?})"
+    ))
 }
 
 /// Resolve a `"host:port"` (or bare `"host"`, defaulting to port 19302) STUN
@@ -259,14 +277,20 @@ async fn send_and_wait(
     socket
         .send_to(req, server)
         .await
-        .map_err(|source| StunError::Io { server: server.to_string(), source })?;
+        .map_err(|source| StunError::Io {
+            server: server.to_string(),
+            source,
+        })?;
 
     let mut buf = [0u8; MAX_RESP_LEN];
     loop {
         let (n, from) = socket
             .recv_from(&mut buf)
             .await
-            .map_err(|source| StunError::Io { server: server.to_string(), source })?;
+            .map_err(|source| StunError::Io {
+                server: server.to_string(),
+                source,
+            })?;
         // Ignore anything that isn't a reply from the server we queried
         // (this socket later carries punch/peer traffic too).
         if from != server {
@@ -305,7 +329,8 @@ mod tests {
     fn xor_mapped_value_v4(ip: Ipv4Addr, port: u16) -> Vec<u8> {
         let mut v = vec![0u8; 8];
         v[1] = 0x01; // family IPv4
-        v[2..4].copy_from_slice(&(((port as u32) ^ (STUN_MAGIC_COOKIE >> 16)) as u16).to_be_bytes());
+        v[2..4]
+            .copy_from_slice(&(((port as u32) ^ (STUN_MAGIC_COOKIE >> 16)) as u16).to_be_bytes());
         v[4..8].copy_from_slice(&(u32::from(ip) ^ STUN_MAGIC_COOKIE).to_be_bytes());
         v
     }
@@ -325,7 +350,11 @@ mod tests {
     fn parses_xor_mapped_response_v4() {
         let txn = [3u8; 12];
         let ip = Ipv4Addr::new(93, 184, 216, 34);
-        let resp = make_response(&txn, ATTR_XOR_MAPPED_ADDRESS, &xor_mapped_value_v4(ip, 12345));
+        let resp = make_response(
+            &txn,
+            ATTR_XOR_MAPPED_ADDRESS,
+            &xor_mapped_value_v4(ip, 12345),
+        );
         assert_eq!(
             parse_binding_response(&resp, &txn).unwrap(),
             SocketAddr::new(ip.into(), 12345)

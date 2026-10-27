@@ -1,5 +1,7 @@
 # p2p-tunnel
 
+[![CI](https://github.com/andrewzuy/dojer2dojer/actions/workflows/ci.yml/badge.svg)](https://github.com/andrewzuy/dojer2dojer/actions/workflows/ci.yml)
+
 A small Rust CLI that lets two machines behind NATs reach each other's private
 TCP services — no ports to open, no relay, no account. It combines
 **STUN** (address discovery), **UDP hole punching** (NAT traversal),
@@ -61,7 +63,8 @@ work.
    connections and forwards each one into a new bidirectional QUIC stream.
    Server side: each incoming QUIC stream is bridged to a TCP connection to
    the configured target (e.g. `192.168.1.50:22`). Bytes are copied in both
-   directions until either side closes. *(Phases 8–9 — in progress.)*
+   directions until either side closes; EOF in one direction only shuts that
+   direction down, so the other keeps flowing.
 
 ## Development status
 
@@ -76,19 +79,19 @@ work.
 | 6 | Runtime self-signed cert + accept-any verifier | ✅ |
 | 7 | QUIC endpoint on the punched socket | ✅ |
 | 8 | TCP→QUIC bridge (client side) | ✅ |
-| 9 | QUIC→TCP bridge (server side) | ⏳ next |
-| 10 | Full `main.rs` wiring, end-to-end | ⏳ |
-| 11 | Logging & diagnostics polish | ⏳ |
-| 12 | Real-world two-machine NAT testing | ⏳ |
+| 9 | QUIC→TCP bridge (server side) | ✅ |
+| 10 | Full `main.rs` wiring, end-to-end | ✅ |
+| 11 | Logging & diagnostics polish | ✅ |
+| 12 | Real-world two-machine NAT testing | ⏳ in progress |
 
 **24 unit tests pass** (`cargo test`): STUN encode/parse, punch timing/
 filtering, role symmetry, cert/fingerprint/config construction, and the
 tunnel bridge's copy/half-close semantics (tested with in-memory streams).
 Per project decision there is deliberately **no loopback test of the QUIC
 server+client path** (one machine playing both roles); the real handshake is
-validated in Phase 12 between two machines on different networks.
-`main.rs` currently runs steps 1–7 and then stops — the binary is not yet a
-working tunnel (see Phase 10).
+validated in Phase 12 between two machines on different networks. The binary
+now runs the **complete end-to-end tunnel** (steps 1–7 plus the role-branched
+stream bridges); Phase 12 is the remaining real-world NAT validation.
 
 ## Requirements
 
@@ -121,8 +124,7 @@ Give it to the other party, then enter their public address below:
 ```
 
 After the punch succeeds the program logs the determined role
-(`server`/`client`) and the certificate fingerprint, then (once Phases
-8–10 land) starts the tunnel:
+(`server`/`client`) and the certificate fingerprint, then starts the tunnel:
 
 - **Client side** (`local_tcp_listen_port` set): `ssh -p 12345 user@127.0.0.1`
   reaches the target on the other machine.
@@ -179,16 +181,18 @@ Read this before using it anywhere sensitive.
   if the QUIC connection drops, re-run. Multiplexing refinements and
   resilience are future work.
 - **Single target / single listen port** per side (concurrent *connections*
-  to that target are supported once Phase 9 lands).
+  to that target are fully supported).
 
 ## Repository layout
 
 ```
 p2p-tunnel/
+├── .github/workflows/ci.yml   # CI: lint + build/test on Linux/macOS/Windows + static musl binary
 ├── Cargo.toml / Cargo.lock
-├── config.toml          # sample configuration
-├── PROGRESS.md          # implementation scratchpad — phase-by-phase state
-├── README.md            # this file
+├── config.toml                # sample configuration
+├── PROGRESS.md                # implementation scratchpad — phase-by-phase state
+├── README.md                  # this file
+├── tests/nat-sim/             # Phase 12 helpers: fake STUN/NAT, echo target, probe client
 └── src/
     ├── main.rs          # the full pipeline, one reused UDP socket
     ├── config.rs        # Config::load (serde/toml)
@@ -197,7 +201,7 @@ p2p-tunnel/
     ├── punch.rs         # hole punching loop
     ├── role.rs          # deterministic server/client decision
     ├── quic.rs          # certs, verifier, endpoint, connect/accept
-    └── tunnel.rs        # TCP↔QUIC bridges (Phases 8/9, next)
+    └── tunnel.rs        # TCP↔QUIC bridges (Phases 8/9)
 ```
 
 The full development plan lives in `../plan.md` (repo parent); `PROGRESS.md`
@@ -207,10 +211,23 @@ tracks what is done and what the next phase needs.
 
 ```sh
 cargo build     # compile
-cargo test      # 22 unit tests
-cargo clippy    # lint (2 expected dead_code warnings: connect/accept, wired in Phase 10)
-RUST_LOG=debug cargo run   # verbose diagnostics
+cargo test      # 24 unit tests
+cargo clippy    # lint (clean with -D warnings)
+cargo fmt --all -- --check   # formatting
+cargo run -- --verbose   # verbose diagnostics (or RUST_LOG=debug)
 ```
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push/PR to `main` (and on demand):
+
+- **lint** (Linux) — `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings`
+- **build + test** — release build and full test suite on a
+  Linux / macOS / Windows matrix (`fail-fast: false`, so one platform failing
+  doesn't mask the others)
+- **linux-static** — `x86_64-unknown-linux-musl` release build, uploaded as a
+  workflow artifact (`p2p-tunnel-x86_64-linux-musl`) — a fully static binary
+  that runs on minimal Linux boxes with no shared-library surprises
 
 ## License
 

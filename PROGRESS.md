@@ -130,6 +130,20 @@ then update this file. Implement phases self-contained from plan.md + this file 
   "is required for the" (missing config option).
 - Failures print `error: {e:#}` (+hint) to stderr and `process::exit(1)`.
 
+### CI — cross-platform GitHub Actions ✅
+- `.github/workflows/ci.yml` (on push/PR to main + manual dispatch), 3 jobs:
+  - `lint` (ubuntu): `cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings`.
+    (Codebase ran through `cargo fmt` for the first time to make the fmt gate green.)
+  - `build-and-test`: matrix ubuntu-latest / macos-latest / windows-latest,
+    `fail-fast: false`; `cargo build --release` + `cargo test` per OS.
+  - `linux-static`: `x86_64-unknown-linux-musl` release build
+    (needs `musl-tools musl-dev`), uploaded as artifact
+    `p2p-tunnel-x86_64-linux-musl` — fully static, portable Linux binary.
+- Actions: `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`,
+  `actions/checkout@v4`, `actions/upload-artifact@v4`.
+- Local parity check before commit: fmt clean, clippy -D warnings clean,
+  24/24 tests pass.
+
 ## Current API surface
 - `config::Config{...}`, `Config::load(&Path)`
 - `cli::Cli{config, verbose}`, `Cli::parse()`, `cli::prompt_peer_addr()`, `cli::parse_peer_addr(&str)`
@@ -151,6 +165,13 @@ then update this file. Implement phases self-contained from plan.md + this file 
 4. Local simulation option (no second machine): two network namespaces +
    `iptables` MASQUERADE to fake a NAT — available tools on this box:
    `sudo`, `ip`, `iptables`, `nft`, `python3` (uid 1000, in `wheel`).
+   **Prep (uncommitted, in `tests/nat-sim/`):** three Python helpers written —
+   `stun_server.py` (fake STUN in the "box" netns that returns fake public
+   addrs AND programs the DNAT rule live, i.e. the NAT port mapping),
+   `echo_target.py` (natA target: banner + echo), `probe_client.py` (natB
+   client: send `hello\n`, expect `PONG: hello\n`, verify clean EOF).
+   Remaining: the driver (netns + MASQUERADE setup, run both tunnel
+   instances, tear down) and the actual run + `TESTING.md`.
 
 ## Standing decisions
 - Errors: `anyhow` at boundaries, `thiserror` for module-level errors (StunError).

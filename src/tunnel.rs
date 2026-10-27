@@ -206,10 +206,7 @@ mod tests {
     /// Stands in for either the local TCP connection or the QUIC stream.
     fn pipe() -> (
         DuplexStream,
-        (
-            ReadHalf<DuplexStream>,
-            WriteHalf<DuplexStream>,
-        ),
+        (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>),
     ) {
         let (end, other) = tokio::io::duplex(65_536);
         (end, tokio::io::split(other))

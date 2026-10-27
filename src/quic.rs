@@ -18,14 +18,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use sha2::Digest;
 use quinn::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
 use quinn::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
 };
-use quinn::rustls::{crypto, DigitallySignedStruct};
+use quinn::rustls::{DigitallySignedStruct, crypto};
+use sha2::Digest;
 use tracing::{debug, info};
 
 /// Common name / DNS SAN for the self-signed certificate.
@@ -36,15 +36,17 @@ pub const CERT_CN: &str = "p2p-tunnel";
 /// Returns `(cert_chain, private_key)` in rustls/pki-types form, ready to be
 /// handed to [`build_server_config`]. The certificate's SHA-256 fingerprint
 /// is logged so the user can share it with their peer out-of-band.
-pub fn generate_self_signed_cert() -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let keypair =
-        rcgen::KeyPair::generate().context("generating ECDSA P-256 key pair")?;
+pub fn generate_self_signed_cert()
+-> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let keypair = rcgen::KeyPair::generate().context("generating ECDSA P-256 key pair")?;
 
     // `CertificateParams::new` takes SANs (auto-detecting DNS vs IP); we add
     // the common name to the subject for human-readable display.
     let mut params = rcgen::CertificateParams::new(vec![CERT_CN.to_string()])
         .context("building certificate parameters")?;
-    params.distinguished_name.push(rcgen::DnType::CommonName, CERT_CN);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, CERT_CN);
 
     let cert = params
         .self_signed(&keypair)
@@ -97,8 +99,14 @@ impl ServerCertVerifier for AcceptAnyServerCert {
         // Deliberately permissive: log the fingerprint and trust the human
         // who typed in the peer address (and can compare fingerprints).
         let fingerprint = fingerprint(end_entity);
-        info!(fingerprint, "accepting peer certificate (MVP: no chain/hostname verification)");
-        debug!("peer certificate subject bytes: {} bytes of DER", end_entity.len());
+        info!(
+            fingerprint,
+            "accepting peer certificate (MVP: no chain/hostname verification)"
+        );
+        debug!(
+            "peer certificate subject bytes: {} bytes of DER",
+            end_entity.len()
+        );
         Ok(ServerCertVerified::assertion())
     }
 
@@ -131,7 +139,9 @@ impl ServerCertVerifier for AcceptAnyServerCert {
     }
 
     fn supported_verify_schemes(&self) -> Vec<quinn::rustls::SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -166,8 +176,7 @@ pub fn create_endpoint(
     socket: std::net::UdpSocket,
     server_config: Option<quinn::ServerConfig>,
 ) -> anyhow::Result<quinn::Endpoint> {
-    let runtime =
-        quinn::default_runtime().context("no async runtime available (need tokio)")?;
+    let runtime = quinn::default_runtime().context("no async runtime available (need tokio)")?;
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         server_config,
@@ -232,7 +241,11 @@ mod tests {
 
         let fp = |c: &CertificateDer<'_>| fingerprint(c);
         assert_eq!(fp(&c1[0]), fp(&c1[0]), "same cert → same fingerprint");
-        assert_ne!(fp(&c1[0]), fp(&c2[0]), "different certs → different fingerprints");
+        assert_ne!(
+            fp(&c1[0]),
+            fp(&c2[0]),
+            "different certs → different fingerprints"
+        );
         assert_eq!(fp(&c1[0]).len(), 64, "SHA-256 hex is 64 chars");
         assert!(fp(&c1[0]).chars().all(|c| c.is_ascii_hexdigit()));
     }

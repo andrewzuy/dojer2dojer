@@ -32,8 +32,8 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
-        let cfg: Config =
-            toml::from_str(&text).with_context(|| format!("parsing config file {}", path.display()))?;
+        let cfg: Config = toml::from_str(&text)
+            .with_context(|| format!("parsing config file {}", path.display()))?;
         if cfg.stun_servers.is_empty() {
             anyhow::bail!("config: `stun_servers` must contain at least one server");
         }

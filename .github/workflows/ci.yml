@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Lint gate: runs once (cheapest runner) — formatting + strict clippy.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Cross-platform build + test matrix: Linux, macOS, Windows.
+  build-and-test:
+    name: build + test — ${{ matrix.os }}
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build (release)
+        run: cargo build --release
+      - name: test
+        run: cargo test
+
+  # Portable static Linux binary (musl) for easy distribution.
+  linux-static:
+    name: static musl binary — linux x86_64
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: install musl toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools musl-dev
+      - name: build (release, musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: stage artifact
+        run: cp target/x86_64-unknown-linux-musl/release/p2p-tunnel p2p-tunnel-x86_64-unknown-linux-musl
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2p-tunnel-x86_64-linux-musl
+          path: p2p-tunnel-x86_64-unknown-linux-musl
