@@ -6,6 +6,9 @@ mod role;
 mod stun;
 mod tunnel;
 
+use std::net::SocketAddr;
+
+use anyhow::Context;
 use clap::Parser;
 use tracing::info;
 
@@ -65,11 +68,37 @@ async fn main() -> anyhow::Result<()> {
         endpoint.set_default_client_config(quic::build_client_config()?);
     }
 
-    // TODO(Phase 8/9): TCP ↔ QUIC stream bridges
-    // TODO(Phase 10): run the bridge loop + re-punch on failure
-    info!(
-        "QUIC endpoint up on the punched socket — stream bridges (Phase 8/9) \
-         and full main wiring (Phase 10) are next; this binary currently stops here"
-    );
+    // ── Phase 10: run the tunnel according to the negotiated role ──
+    match role {
+        role::Role::Server => {
+            let target = cfg
+                .remote_target_addr
+                .as_deref()
+                .context(
+                    "config: `remote_target_addr` is required for the server role \n                     (the private ip:port to forward tunneled TCP to)",
+                )?;
+            let target: SocketAddr = target
+                .parse()
+                .with_context(|| {
+                    format!(
+                        "config: `remote_target_addr` = {target:?} is not a valid ip:port"
+                    )
+                })?;
+            info!("waiting for the peer's QUIC connection…");
+            let conn = quic::accept(&endpoint).await?;
+            tunnel::run_server_side(conn, target).await?;
+        }
+        role::Role::Client => {
+            let port = cfg
+                .local_tcp_listen_port
+                .context(
+                    "config: `local_tcp_listen_port` is required for the client role \n                     (the local TCP port to expose through the tunnel)",
+                )?;
+            info!("initiating QUIC connection to peer…");
+            let conn = quic::connect(&endpoint, peer_addr).await?;
+            tunnel::run_client_side(conn, port).await?;
+        }
+    }
+    info!("tunnel closed; goodbye");
     Ok(())
 }
