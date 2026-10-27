@@ -10,18 +10,31 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use clap::Parser;
-use tracing::info;
+use tracing::{info, Instrument};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    let cli = cli::Cli::parse();
+
+    // Logging: RUST_LOG wins if set, then --verbose, then info.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+                .unwrap_or_else(|_| (if cli.verbose { "debug" } else { "info" }).into()),
         )
         .init();
 
-    let cli = cli::Cli::parse();
+    if let Err(e) = run(cli).await {
+        eprintln!();
+        eprintln!("error: {e:#}");
+        if let Some(hint) = hint_for(&e) {
+            eprintln!("{hint}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: cli::Cli) -> anyhow::Result<()> {
     let cfg = config::Config::load(&cli.config)?;
 
     info!(
@@ -37,7 +50,9 @@ async fn main() -> anyhow::Result<()> {
     // THE socket: bound once, reused for STUN → hole punching → QUIC.
     // (0.0.0.0:0 keeps the MVP on IPv4, which is what home NATs typically hand out.)
     let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-    let public_addr = stun::discover_public_addr(&socket, &cfg.stun_servers).await?;
+    let public_addr = stun::discover_public_addr(&socket, &cfg.stun_servers)
+        .instrument(tracing::info_span!("stun"))
+        .await?;
     info!(%public_addr, "discovered public address");
 
     // Display own public address and ask for the peer's.
@@ -47,7 +62,9 @@ async fn main() -> anyhow::Result<()> {
     let peer_addr = cli::prompt_peer_addr()?;
     info!(%peer_addr, "peer address entered");
 
-    punch::punch(&socket, peer_addr, &cfg).await?;
+    punch::punch(&socket, peer_addr, &cfg)
+        .instrument(tracing::info_span!("punch"))
+        .await?;
 
     let role = role::determine_role(public_addr, peer_addr);
     info!(role = role.as_str(), "role determined");
@@ -58,7 +75,9 @@ async fn main() -> anyhow::Result<()> {
     // ── Phase 7: QUIC endpoint on the punched socket ──
     // The socket has done its STUN + punch job; hand it to quinn, which
     // takes ownership and runs its own I/O driver on it.
-    let std_socket = socket.into_std()?;
+    let std_socket = socket
+        .into_std()
+        .context("converting the punched UDP socket for quinn")?;
     let server_config = match role {
         role::Role::Server => Some(quic::build_server_config(cert_chain, key)?),
         role::Role::Client => None,
@@ -85,8 +104,12 @@ async fn main() -> anyhow::Result<()> {
                     )
                 })?;
             info!("waiting for the peer's QUIC connection…");
-            let conn = quic::accept(&endpoint).await?;
-            tunnel::run_server_side(conn, target).await?;
+            let conn = quic::accept(&endpoint)
+                .instrument(tracing::info_span!("quic_handshake"))
+                .await?;
+            tunnel::run_server_side(conn, target)
+                .instrument(tracing::info_span!("tunnel", role = "server"))
+                .await?;
         }
         role::Role::Client => {
             let port = cfg
@@ -95,10 +118,47 @@ async fn main() -> anyhow::Result<()> {
                     "config: `local_tcp_listen_port` is required for the client role \n                     (the local TCP port to expose through the tunnel)",
                 )?;
             info!("initiating QUIC connection to peer…");
-            let conn = quic::connect(&endpoint, peer_addr).await?;
-            tunnel::run_client_side(conn, port).await?;
+            let conn = quic::connect(&endpoint, peer_addr)
+                .instrument(tracing::info_span!("quic_handshake"))
+                .await?;
+            tunnel::run_client_side(conn, port)
+                .instrument(tracing::info_span!("tunnel", role = "client"))
+                .await?;
         }
     }
     info!("tunnel closed; goodbye");
     Ok(())
+}
+
+/// A short, actionable hint for the common failure modes.
+fn hint_for(err: &anyhow::Error) -> Option<String> {
+    let chain = format!("{err:#}");
+    if chain.contains("STUN discovery failed") {
+        Some(
+            "hint: check internet connectivity and that outbound UDP is not blocked. \
+             If you are behind CGNAT, STUN may report a carrier address you cannot \
+             receive on — this MVP cannot traverse that (see plan: TURN fallback)."
+                .into(),
+        )
+    } else if chain.contains("hole punching timed out") {
+        Some(
+            "hint: double-check the peer's address (it goes stale when the peer's NAT \
+             binding expires or they restart). One side may also be behind a symmetric \
+             NAT, which simultaneous UDP punching cannot open — this MVP has no TURN fallback."
+                .into(),
+        )
+    } else if chain.contains("QUIC handshake") {
+        Some(
+            "hint: the UDP hole was open but the QUIC/TLS handshake did not complete. A \
+             middlebox may be interfering, or the peer's process exited. Retry on both sides."
+                .into(),
+        )
+    } else if chain.contains("is required for the") {
+        Some(
+            "hint: add the missing option to your config.toml (see the sample config comments)."
+                .into(),
+        )
+    } else {
+        None
+    }
 }

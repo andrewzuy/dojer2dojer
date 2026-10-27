@@ -9,6 +9,9 @@ pub struct Cli {
     /// Path to the TOML config file.
     #[arg(long, default_value = "./config.toml")]
     pub config: PathBuf,
+    /// Enable debug logging (RUST_LOG takes precedence if set).
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 /// Prompt on stdin for the peer's public address until valid input arrives.
