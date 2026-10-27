@@ -1,16 +1,16 @@
 //! TCP↔QUIC stream bridge.
 //!
-//! Phase 8 (this file, for now): client side — a local TCP listener whose
-//! accepted connections are each bridged to a fresh bidirectional QUIC
-//! stream, so `ssh -p <port> user@127.0.0.1` reaches the other machine's
-//! target through the tunnel.
-//! Phase 9 (next): server side — incoming QUIC streams → TCP connections to
-//! the configured private target.
+//! Client side (Phase 8): a local TCP listener whose accepted connections
+//! are each bridged to a fresh bidirectional QUIC stream, so
+//! `ssh -p <port> user@127.0.0.1` reaches the other machine's target
+//! through the tunnel.
+//! Server side (Phase 9): incoming QUIC streams → TCP connections to the
+//! configured private target.
 
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use quinn::Connection;
+use quinn::{Connection, RecvStream, SendStream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -62,7 +62,8 @@ pub async fn run_client_side(conn: Connection, listen_port: u16) -> anyhow::Resu
     Ok(())
 }
 
-/// Bridge one local TCP connection to one fresh bidirectional QUIC stream.
+/// Bridge one local TCP connection to one fresh bidirectional QUIC stream
+/// (client side: we open the stream).
 ///
 /// Resolves with `(bytes_tcp_to_quic, bytes_quic_to_tcp)` once both
 /// directions are finished, or with an error if either direction fails.
@@ -71,6 +72,74 @@ async fn bridge_stream(conn: Connection, tcp: TcpStream) -> anyhow::Result<(u64,
         .open_bi()
         .await
         .context("open bidirectional QUIC stream")?;
+    bridge_quic_tcp(send, recv, tcp).await
+}
+
+/// Server side of the tunnel: forward every incoming QUIC stream to a TCP
+/// connection to `target_addr` (e.g. the private `ip:port` of an SSH server
+/// the client wants to reach).
+///
+/// Each stream gets its own task, so multiple concurrent tunnels (several
+/// `ssh` sessions, say) run independently. Runs until the QUIC connection
+/// closes, then returns.
+pub async fn run_server_side(conn: Connection, target_addr: SocketAddr) -> anyhow::Result<()> {
+    tracing::info!(
+        %target_addr,
+        "tunnel server ready — forwarding incoming QUIC streams to {target_addr}"
+    );
+    loop {
+        tokio::select! {
+            res = conn.accept_bi() => {
+                match res {
+                    Ok((mut send, recv)) => {
+                        tokio::spawn(async move {
+                            let tcp = match TcpStream::connect(target_addr).await {
+                                Ok(tcp) => tcp,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        %target_addr, error = ?e,
+                                        "cannot reach target; closing stream"
+                                    );
+                                    // FIN so the client sees EOF instead of a hang.
+                                    let _ = send.finish();
+                                    return;
+                                }
+                            };
+                            tracing::info!(%target_addr, "target connection established");
+                            match bridge_quic_tcp(send, recv, tcp).await {
+                                Ok((up, down)) => tracing::info!(
+                                    %target_addr, bytes_up = up, bytes_down = down,
+                                    "tunneled connection closed"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    %target_addr, error = ?e,
+                                    "tunneled connection failed"
+                                ),
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::info!(?e, "QUIC stream acceptance ended; stopping tunnel server");
+                        break;
+                    }
+                }
+            }
+            err = conn.closed() => {
+                tracing::info!(?err, "QUIC connection closed; stopping tunnel server");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bridge an already-received bidirectional QUIC stream to a TCP connection
+/// (server side: the stream arrived, we did not open it).
+async fn bridge_quic_tcp(
+    send: SendStream,
+    recv: RecvStream,
+    tcp: TcpStream,
+) -> anyhow::Result<(u64, u64)> {
     let (tcp_read, tcp_write) = tcp.into_split();
     // Direction A (up): local TCP → QUIC. Direction B (down): QUIC → local TCP.
     bridge_halves(tcp_read, send, recv, tcp_write).await
