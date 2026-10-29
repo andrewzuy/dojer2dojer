@@ -178,7 +178,46 @@ don't have to predict which role you'll be.
   [Limitations](#limitations))
 - For real use: a way to compare the two addresses out-of-band (any chat)
 
-## Building
+## Getting a binary
+
+**Prebuilt binaries** are published on the
+[GitHub Releases page](https://github.com/andrewzuy/dojer2dojer/releases).
+Each release contains:
+
+| Asset | Platform |
+| --- | --- |
+| `p2p-tunnel-vX.Y.Z-x86_64-unknown-linux-musl` | Linux x86_64 (static — no dependencies) |
+| `p2p-tunnel-vX.Y.Z-aarch64-unknown-linux-musl` | Linux ARM64 (static — Raspberry Pi & co.) |
+| `p2p-tunnel-vX.Y.Z-aarch64-apple-darwin` | macOS (Apple Silicon) |
+| `p2p-tunnel-vX.Y.Z-x86_64-apple-darwin` | macOS (Intel) |
+| `p2p-tunnel-vX.Y.Z-x86_64-pc-windows-msvc.exe` | Windows x86_64 |
+| `SHA256SUMS` | SHA-256 checksums for the above |
+
+The Release workflow (`.github/workflows/release.yml`) builds all of these
+and publishes them automatically **when a `v*` tag is pushed** — or on demand
+via *Actions → Release → Run workflow* (enter the tag to publish). Creating a
+release is just:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Verify a download before running it:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+The Linux builds are fully static (musl) — no shared-library surprises on
+minimal distros:
+
+```sh
+# e.g. on a bare Debian/Alpine box:
+chmod +x p2p-tunnel-v0.1.0-x86_64-unknown-linux-musl
+./p2p-tunnel-v0.1.0-x86_64-unknown-linux-musl
+```
+
+## Building from source
 
 ```sh
 cargo build --release
@@ -186,16 +225,7 @@ cargo build --release
 ```
 
 The binary is self-contained (no runtime dependencies beyond the usual
-libc/OS crypto). On Linux, the CI workflow also produces a **fully static
-musl build** (no shared-library surprises on minimal distros) as a workflow
-artifact: run any workflow on [`Actions`](https://github.com/andrewzuy/dojer2dojer/actions)
-and download `p2p-tunnel-x86_64-linux-musl`.
-
-```sh
-# e.g. on a bare Debian/Alpine box:
-chmod +x p2p-tunnel-x86_64-linux-musl
-./p2p-tunnel-x86_64-linux-musl
-```
+libc/OS crypto).
 
 ---
 
@@ -506,7 +536,9 @@ probe client.
 
 ```
 .
-├── .github/workflows/ci.yml   # CI: lint + build/test on Linux/macOS/Windows + static musl binary
+├── .github/workflows/
+│   ├── ci.yml                 # CI: lint + build/test on Linux/macOS/Windows + static musl binary
+│   └── release.yml            # tag → prebuilt binaries published as a GitHub Release
 ├── Cargo.toml / Cargo.lock
 ├── config.toml                # sample configuration
 ├── PROGRESS.md                # implementation scratchpad — phase-by-phase state

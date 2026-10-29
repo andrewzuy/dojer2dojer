@@ -52,7 +52,17 @@ pub async fn punch(socket: &UdpSocket, peer_addr: SocketAddr, cfg: &Config) -> a
                 debug!(peer = %peer_addr, sent, "sent punch packet");
             }
             res = socket.recv_from(&mut buf) => {
-                let (n, from) = res.context("waiting for peer packet")?;
+                // On Windows, ICMP "port/host unreachable" replies to our
+                // outbound punch packets surface as *recv errors* (Linux
+                // drops them silently). Expected while the peer's NAT is
+                // still closed — log and keep punching until timeout.
+                let (n, from) = match res {
+                    Ok(ok) => ok,
+                    Err(e) => {
+                        debug!(error = %e, "recv error during punch (likely ICMP unreachable); continuing");
+                        continue;
+                    }
+                };
                 if from == peer_addr {
                     info!(
                         from = %from,

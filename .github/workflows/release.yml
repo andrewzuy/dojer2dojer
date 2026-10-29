@@ -1,0 +1,119 @@
+name: Release
+
+# Builds prebuilt binaries for all supported platforms and publishes them as a
+# GitHub Release. Triggered by pushing a `v*` tag, or on demand via the
+# "Run workflow" button on the Actions tab (enter the tag to publish).
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+# Only the publish job needs write access.
+permissions:
+  contents: write
+
+# Never run two releases concurrently (tag push + manual dispatch racing).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static Linux x86_64 (musl) — runs on any distro, no shared libs.
+          # cc-rs finds `musl-gcc` from musl-tools for ring's C build.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin: p2p-tunnel
+            apt: musl-tools musl-dev
+          # Static Linux ARM64 (musl) — Raspberry Pi & ARM servers,
+          # cross-compiled. ring needs an aarch64 C compiler (apt provides
+          # `aarch64-linux-gnu-gcc`); cc-rs picks it up via CC_*.
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            bin: p2p-tunnel
+            apt: musl-tools musl-dev gcc-aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            rustflags: -C linker=aarch64-linux-gnu-gcc
+          # macOS Apple Silicon (native on the arm64 runner).
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: p2p-tunnel
+          # macOS Intel (cross-compiled from the arm64 runner — same
+          # toolchain, no extra setup needed).
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin: p2p-tunnel
+          # Windows x86_64 (native, MSVC).
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: p2p-tunnel.exe
+            ext: .exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: install build dependencies
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ${{ matrix.apt }}
+      - name: build (release)
+        env:
+          # Only meaningful for the aarch64-musl entry; empty (and ignored
+          # by cc-rs) for everything else.
+          CC_aarch64_unknown_linux_musl: ${{ matrix.cc }}
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: stage binary
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" \
+             "dist/p2p-tunnel-${tag}-${{ matrix.target }}${{ matrix.ext }}"
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: gather binaries and write checksums
+        run: |
+          mkdir -p release
+          find dist -type f -name 'p2p-tunnel-*' -exec cp {} release/ \;
+          (cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          ls -l release/
+      - name: publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: release/
+          generate_release_notes: true
+          fail_on_unmatched_files: true

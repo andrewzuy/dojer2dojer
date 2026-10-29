@@ -43,6 +43,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: build (release)
         run: cargo build --release
+      - name: test
+        run: cargo test
 
   # Portable static Linux binary (musl) for easy distribution.
   linux-static:

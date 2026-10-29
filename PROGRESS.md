@@ -144,6 +144,32 @@ then update this file. Implement phases self-contained from plan.md + this file 
 - Local parity check before commit: fmt clean, clippy -D warnings clean,
   24/24 tests pass.
 
+### Release workflow — prebuilt binaries ✅
+- `.github/workflows/release.yml`, triggered by a `v*` tag push, or on demand
+  (*Actions → Run workflow*, enter the tag name).
+- `build` job, matrix of 5 targets (one job each, `fail-fast: false`):
+  - Linux x86_64 `x86_64-unknown-linux-musl` (static; `musl-tools musl-dev`)
+  - Linux ARM64 `aarch64-unknown-linux-musl` (static, cross-compiled from
+    ubuntu; `ring`'s C build via apt's `gcc-aarch64-linux-gnu`, wired in with
+    `CC_aarch64_unknown_linux_musl` + `-C linker=aarch64-linux-gnu-gcc`)
+  - macOS `aarch64-apple-darwin` (native on the arm64 runner)
+  - macOS `x86_64-apple-darwin` (cross — same toolchain, no extra setup)
+  - Windows `x86_64-pc-windows-msvc` (native)
+- `publish` job gathers the artifacts, writes `SHA256SUMS`, uploads everything
+  to the GitHub Release via `softprops/action-gh-release@v2`
+  (`generate_release_notes`, `fail_on_unmatched_files`).
+- Binary names: `p2p-tunnel-<tag>-<target-triple>` (`.exe` on Windows).
+
+### Windows bug found by CI, fixed ✅
+- First CI runs failed `build + test — windows-latest`: ICMP "port
+  unreachable" replies to outbound UDP punch packets surface as `recv_from`
+  *errors* on Windows (Linux drops them silently), and `punch()` bailed on the
+  first one instead of continuing until timeout.
+- Fix in `src/punch.rs`: recv errors during punching are now logged at debug
+  and ignored (keep punching until timeout). `punch_times_out_without_peer`
+  doubles as the cross-platform regression test; the `cargo test` step was
+  restored in `ci.yml` (it had been skipped on all OSes as a workaround).
+
 ## Current API surface
 - `config::Config{...}`, `Config::load(&Path)`
 - `cli::Cli{config, verbose}`, `Cli::parse()`, `cli::prompt_peer_addr()`, `cli::parse_peer_addr(&str)`
