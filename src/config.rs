@@ -13,6 +13,11 @@ pub struct Config {
     /// How long to keep trying to hole-punch before giving up, in seconds.
     #[serde(default = "default_punch_timeout_secs")]
     pub punch_timeout_secs: u64,
+    /// How often (in seconds) to send a QUIC keep-alive PING while the tunnel
+    /// is idle, so NAT port mappings don't expire and drop the connection.
+    /// `0` disables keep-alive.
+    #[serde(default = "default_keep_alive_interval_secs")]
+    pub keep_alive_interval_secs: u64,
     /// Local TCP port to listen on (the "client side" of the tunnel).
     pub local_tcp_listen_port: Option<u16>,
     /// Where to forward incoming tunneled TCP (the "server side" of the tunnel).
@@ -25,6 +30,10 @@ fn default_punch_interval_ms() -> u64 {
 
 fn default_punch_timeout_secs() -> u64 {
     30
+}
+
+fn default_keep_alive_interval_secs() -> u64 {
+    5
 }
 
 impl Config {
@@ -62,6 +71,7 @@ remote_target_addr = "127.0.0.1:8080"
         assert_eq!(cfg.stun_servers, vec!["stun.l.google.com:19302"]);
         assert_eq!(cfg.punch_interval_ms, 500); // default
         assert_eq!(cfg.punch_timeout_secs, 30); // default
+        assert_eq!(cfg.keep_alive_interval_secs, 5); // default
         assert_eq!(cfg.local_tcp_listen_port, Some(12345));
         assert_eq!(cfg.remote_target_addr.as_deref(), Some("127.0.0.1:8080"));
         let _ = std::fs::remove_file(&path);
@@ -77,12 +87,14 @@ remote_target_addr = "127.0.0.1:8080"
 stun_servers = ["a:1", "b:2"]
 punch_interval_ms = 250
 punch_timeout_secs = 5
+keep_alive_interval_secs = 0
 "#,
         )
         .unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.punch_interval_ms, 250);
         assert_eq!(cfg.punch_timeout_secs, 5);
+        assert_eq!(cfg.keep_alive_interval_secs, 0); // explicit override
         assert_eq!(cfg.local_tcp_listen_port, None);
         assert_eq!(cfg.remote_target_addr, None);
         let _ = std::fs::remove_file(&path);

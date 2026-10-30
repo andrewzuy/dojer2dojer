@@ -354,6 +354,7 @@ typing a key name wrong won't error out, so copy the shipped sample.
 | `stun_servers` | `["host:port", …]` | *(required, non-empty)* | STUN servers tried in order (hostnames OK, port defaults to 19302 if omitted). Each gets up to 3 s; the whole list is tried twice. |
 | `punch_interval_ms` | `u64` | `500` | Milliseconds between outbound hole-punch packets. |
 | `punch_timeout_secs` | `u64` | `30` | Give up on hole punching after this long (the error includes how many packets were sent). |
+| `keep_alive_interval_secs` | `u64` | `5` | Seconds between QUIC keep-alive PING packets sent while the tunnel is idle. Idle NAT devices drop the port mapping of a silent connection, so these small PINGs keep the tunnel alive; `0` disables keep-alive (the tunnel then dies after the NAT's idle timeout, typically a few minutes). |
 | `local_tcp_listen_port` | `u16` | unset | **Read only if this machine gets the client role.** The `127.0.0.1` port that offers the tunnel (e.g. `12345`). Loopback only — never exposed to your LAN. |
 | `remote_target_addr` | `"ip:port"` | unset | **Read only if this machine gets the server role.** The private TCP target on *this* machine's network that tunneled traffic is delivered to (e.g. `"127.0.0.1:22"`). |
 

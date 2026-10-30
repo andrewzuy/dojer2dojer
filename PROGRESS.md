@@ -170,6 +170,20 @@ then update this file. Implement phases self-contained from plan.md + this file 
   doubles as the cross-platform regression test; the `cargo test` step was
   restored in `ci.yml` (it had been skipped on all OSes as a workaround).
 
+### Idle-tunnel drop fixed: QUIC keep-alive PINGs ✅
+- Symptom: after the tunnel sat idle (no traffic), the connection was
+  dropped. QUIC itself is fine (its 30 s idle timeout is generous), but the
+  NATs on both sides drop the port *mapping* of a silent connection after
+  their own idle timeout, so the next packet has nowhere to go.
+- Fix: enable QUIC keep-alive. The endpoint now sends a small PING frame
+  every `keep_alive_interval_secs` (default **5 s**, new config key, `0` =
+  off) once the connection is established. Implemented in `src/quic.rs`
+  (`transport_config_with_keep_alive`, wired into `build_client_config` /
+  `build_server_config`) and driven from `src/main.rs` + `src/config.rs`.
+  Enabled on **both** roles so the tunnel survives regardless of which side
+  the NAT is stricter on. `keep_alive_interval` must stay below the QUIC
+  idle timeout of both peers (default 30 s) — 5 s is well under.
+
 ## Current API surface
 - `config::Config{...}`, `Config::load(&Path)`
 - `cli::Cli{config, verbose}`, `Cli::parse()`, `cli::prompt_peer_addr()`, `cli::parse_peer_addr(&str)`
@@ -177,7 +191,7 @@ then update this file. Implement phases self-contained from plan.md + this file 
 - `punch::punch(&UdpSocket, SocketAddr, &Config)`
 - `role::{Role, determine_role}`
 - `quic::{CERT_CN, generate_self_signed_cert, fingerprint, build_client_config, build_server_config,
-  create_endpoint, connect, accept}`
+  transport_config_with_keep_alive, create_endpoint, connect, accept}`
 - `tunnel::{run_client_side, run_server_side, bridge_halves}` — all phases 8–10 wired in main.
 
 ## Next: Phase 12 — real two-machine NAT test (first real QUIC handshake validation)

@@ -16,6 +16,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use quinn::rustls::client::danger::{
@@ -145,8 +146,25 @@ impl ServerCertVerifier for AcceptAnyServerCert {
     }
 }
 
-/// Build the QUIC **client** configuration (accept-any certificate policy).
-pub fn build_client_config() -> anyhow::Result<quinn::ClientConfig> {
+/// Build a QUIC transport config that keeps an idle connection alive.
+///
+/// `keep_alive = Some(interval)` makes the endpoint send a QUIC PING frame
+/// every `interval` once the connection is established. NAT devices drop the
+/// port mapping of a silent connection after their own idle timeout, so
+/// without these periodic packets a healthy but idle tunnel is silently
+/// killed. `None` disables keep-alive (quinn's default).
+///
+/// Only one side of the connection needs it, but we enable it on both
+/// (client and server role) so the tunnel survives regardless of role.
+pub fn transport_config_with_keep_alive(keep_alive: Option<Duration>) -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(keep_alive);
+    transport
+}
+
+/// Build the QUIC **client** configuration (accept-any certificate policy),
+/// with QUIC keep-alive PINGs every `keep_alive` while idle (`None`: off).
+pub fn build_client_config(keep_alive: Option<Duration>) -> anyhow::Result<quinn::ClientConfig> {
     let provider: Arc<crypto::CryptoProvider> = Arc::new(crypto::ring::default_provider());
     let rustls_config = quinn::rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -156,16 +174,22 @@ pub fn build_client_config() -> anyhow::Result<quinn::ClientConfig> {
         .with_no_client_auth();
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)
         .context("building QUIC client crypto configuration")?;
-    Ok(quinn::ClientConfig::new(Arc::new(quic_crypto)))
+    let mut client = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    client.transport_config(Arc::new(transport_config_with_keep_alive(keep_alive)));
+    Ok(client)
 }
 
-/// Build the QUIC **server** configuration presenting our self-signed cert.
+/// Build the QUIC **server** configuration presenting our self-signed cert,
+/// with QUIC keep-alive PINGs every `keep_alive` while idle (`None`: off).
 pub fn build_server_config(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+    keep_alive: Option<Duration>,
 ) -> anyhow::Result<quinn::ServerConfig> {
-    quinn::ServerConfig::with_single_cert(cert_chain, key)
-        .context("building QUIC server configuration")
+    let mut server = quinn::ServerConfig::with_single_cert(cert_chain, key)
+        .context("building QUIC server configuration")?;
+    server.transport_config(Arc::new(transport_config_with_keep_alive(keep_alive)));
+    Ok(server)
 }
 
 /// Create a QUIC endpoint over an existing (STUN'd, hole-punched) UDP socket.
@@ -253,7 +277,18 @@ mod tests {
     #[test]
     fn client_and_server_configs_build() {
         let (certs, key) = generate_self_signed_cert().unwrap();
-        build_client_config().expect("client config builds");
-        build_server_config(certs, key).expect("server config builds");
+        // With keep-alive enabled (the default in main) and disabled.
+        build_client_config(Some(Duration::from_secs(5))).expect("client config builds");
+        build_client_config(None).expect("client config builds without keep-alive");
+        build_server_config(certs, key, Some(Duration::from_secs(5)))
+            .expect("server config builds");
+    }
+
+    #[test]
+    fn transport_config_accepts_keep_alive_values() {
+        let with_ka = transport_config_with_keep_alive(Some(Duration::from_secs(5)));
+        let _ = with_ka; // builds; the value is applied inside quinn-proto
+        let without_ka = transport_config_with_keep_alive(None);
+        let _ = without_ka;
     }
 }

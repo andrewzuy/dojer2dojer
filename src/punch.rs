@@ -99,6 +99,7 @@ mod tests {
             stun_servers: vec!["stun.l.google.com:19302".into()],
             punch_interval_ms: interval_ms,
             punch_timeout_secs: timeout_secs,
+            keep_alive_interval_secs: 5,
             local_tcp_listen_port: None,
             remote_target_addr: None,
         }

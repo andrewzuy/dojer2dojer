@@ -13,6 +13,10 @@ punch_interval_ms = 500
 # Seconds to keep trying to hole-punch before giving up.
 punch_timeout_secs = 30
 
+# Seconds between QUIC keep-alive PING packets, sent while the tunnel is
+# idle so NAT port mappings don't expire and drop the connection. 0 = off.
+keep_alive_interval_secs = 5
+
 # Client side: local TCP port to listen on and forward through the tunnel.
 # Uncomment on the machine that exposes a local service port.
 # local_tcp_listen_port = 12345

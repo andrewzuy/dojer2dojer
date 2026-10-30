@@ -7,6 +7,7 @@ mod stun;
 mod tunnel;
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
@@ -42,6 +43,7 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
         stun_servers = ?cfg.stun_servers,
         punch_interval_ms = cfg.punch_interval_ms,
         punch_timeout_secs = cfg.punch_timeout_secs,
+        keep_alive_interval_secs = cfg.keep_alive_interval_secs,
         local_tcp_listen_port = ?cfg.local_tcp_listen_port,
         remote_target_addr = ?cfg.remote_target_addr,
         "loaded config"
@@ -69,6 +71,13 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
     let role = role::determine_role(public_addr, peer_addr);
     info!(role = role.as_str(), "role determined");
 
+    // QUIC keep-alive: a PING every `keep_alive` keeps the tunnel alive while
+    // idle — NAT port mappings expire on silent connections and would drop a
+    // healthy tunnel. `0` in the config disables it.
+    let keep_alive = (cfg.keep_alive_interval_secs > 0)
+        .then(|| Duration::from_secs(cfg.keep_alive_interval_secs));
+    info!(?keep_alive, "QUIC keep-alive configured");
+
     // ── Phase 6: fresh self-signed certificate for the QUIC handshake ──
     let (cert_chain, key) = quic::generate_self_signed_cert()?;
 
@@ -79,12 +88,12 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
         .into_std()
         .context("converting the punched UDP socket for quinn")?;
     let server_config = match role {
-        role::Role::Server => Some(quic::build_server_config(cert_chain, key)?),
+        role::Role::Server => Some(quic::build_server_config(cert_chain, key, keep_alive)?),
         role::Role::Client => None,
     };
     let mut endpoint = quic::create_endpoint(std_socket, server_config)?;
     if matches!(role, role::Role::Client) {
-        endpoint.set_default_client_config(quic::build_client_config()?);
+        endpoint.set_default_client_config(quic::build_client_config(keep_alive)?);
     }
 
     // ── Phase 10: run the tunnel according to the negotiated role ──
