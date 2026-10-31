@@ -46,14 +46,15 @@ makes the design work.
 3. [Requirements](#requirements)
 4. [Building](#building)
 5. [Quick start (two machines, SSH to a home server)](#quick-start)
-6. [Configuration reference](#configuration-reference-configtoml)
-7. [CLI reference](#cli-reference)
-8. [Examples](#examples)
-9. [Security model](#security-model)
-10. [Troubleshooting](#troubleshooting)
-11. [Limitations](#limitations)
-12. [Development](#development)
-13. [License](#license)
+6. [Automatic address exchange over Telegram](#automatic-address-exchange-over-telegram)
+7. [Configuration reference](#configuration-reference-configtoml)
+8. [CLI reference](#cli-reference)
+9. [Examples](#examples)
+10. [Security model](#security-model)
+11. [Troubleshooting](#troubleshooting)
+12. [Limitations](#limitations)
+13. [Development](#development)
+14. [License](#license)
 
 ---
 
@@ -70,11 +71,17 @@ stay under our control for the later phases). Each server gets up to 3 s, and
 the whole list is tried twice. The response's `XOR-MAPPED-ADDRESS` attribute
 tells us the public `ip:port` the rest of the internet sees for this socket.
 
-### 2. Manual peer exchange
+### 2. Peer address exchange
 
-Your public address is printed. Share it with the other person (chat, phone,
-carrier pigeon) and type *their* address into the prompt. Input is validated
-and re-prompted on bad input.
+Your public address is printed. Two ways to complete the exchange:
+
+- **Manual (default):** share your address with the other person (chat, phone,
+  carrier pigeon) and type *their* address into the prompt. Input is validated
+  and re-prompted on bad input.
+- **Automatic over Telegram:** run with `--telegram` and a configured
+  `[telegram]` table, and the two bots DM each other their public addresses
+  instead — no copy/paste. See [Automatic address exchange over
+  Telegram](#automatic-address-exchange-over-telegram).
 
 > **Addresses are session-scoped.** The port (and sometimes the IP) changes
 > every time the process runs, and the NAT mapping goes away when the process
@@ -343,6 +350,67 @@ session, repeat from step 3 (addresses change every run).
 
 ---
 
+## Automatic address exchange over Telegram
+
+The manual "type the address" prompt is the default and always works. If you'd
+rather not copy/paste between two terminals, both machines can exchange
+addresses automatically using Telegram's [bot-to-bot](https://core.telegram.org/api/bots/bot-to-bot)
+capability — each side's bot DMs the other side's bot a self-describing
+`PTUN v1 <ip:port>` message, and each waits for the peer's to arrive.
+
+This is **optional**: nothing changes unless you add the `[telegram]` table
+*and* pass `--telegram`. The manual prompt remains the fallback whenever
+`--telegram` isn't set, the table is missing, the token is invalid, or the
+wait times out.
+
+### Set it up
+
+1. Create **two** bots in [@BotFather](https://t.me/BotFather) (one per
+   machine) and note each one's **API token** (`123456:ABC-DEF…`).
+2. On **each** bot: BotFather → *Bot Settings* → *Bot-to-Bot Communication*
+   → **Enable**. Without this, `sendMessage` to a bot returns
+   `USER_BOT_TO_BOT_DISABLED`.
+3. Get each bot's **numeric id** (BotFather can show it, or any `@id` bot on
+   the bot's profile).
+4. In each machine's `config.toml`, add a `[telegram]` table with **this
+   machine's** token and the **peer bot's** id:
+
+   ```toml
+   [telegram]
+   token = "123456:ABC-DEF…"   # THIS machine's bot token
+   peer_bot_id = 987654321      # the PEER bot's numeric id
+   # timeout_secs = 120         # optional; default 120
+   ```
+
+   The two tables point at each other: machine A's `peer_bot_id` is bot B's
+   id, and machine B's `peer_bot_id` is bot A's id.
+5. Run both sides with the flag:
+
+   ```sh
+   ./p2p-tunnel --telegram
+   ```
+
+   Each side sends its address and waits (up to `timeout_secs`) for the
+   peer's. On success it proceeds straight to hole punching; on timeout or
+   error it logs the reason and drops back to the manual prompt.
+
+### How it stays loop-safe
+
+Bots replying to bots can ping-pong forever. This implementation prevents
+that:
+
+- It **only ever sends once** — its own address — and never auto-replies to
+  incoming `PTUN` messages.
+- It **ignores its own echoes** (messages whose `from.id` is its own bot
+  id), so the reply it receives isn't treated as a new peer.
+- It only accepts a `PTUN v1` payload from the **specific peer bot id**
+  configured; messages from any other sender are discarded.
+
+The payload format is `PTUN v1 <ip:port>`; anything not matching that prefix
+is ignored. Role negotiation (server vs client) is unchanged and still
+computed locally from the two addresses — Telegram only carries the addresses
+themselves.
+
 ## Configuration reference (`config.toml`)
 
 The file is optional to *find* (`--config` selects it, default `./config.toml`)
@@ -357,9 +425,12 @@ typing a key name wrong won't error out, so copy the shipped sample.
 | `keep_alive_interval_secs` | `u64` | `5` | Seconds between QUIC keep-alive PING packets sent while the tunnel is idle. Idle NAT devices drop the port mapping of a silent connection, so these small PINGs keep the tunnel alive; `0` disables keep-alive (the tunnel then dies after the NAT's idle timeout, typically a few minutes). |
 | `local_tcp_listen_port` | `u16` | unset | **Read only if this machine gets the client role.** The `127.0.0.1` port that offers the tunnel (e.g. `12345`). Loopback only — never exposed to your LAN. |
 | `remote_target_addr` | `"ip:port"` | unset | **Read only if this machine gets the server role.** The private TCP target on *this* machine's network that tunneled traffic is delivered to (e.g. `"127.0.0.1:22"`). |
+| `[telegram].token` | `string` | unset | **Only used with `--telegram`.** This machine's bot API token. The whole `[telegram]` table is optional and ignored unless the flag is passed. |
+| `[telegram].peer_bot_id` | `i64` | unset | The **peer bot's** numeric id — the `chat_id` its `PTUN` address message is sent to. |
+| `[telegram].timeout_secs` | `u64` | `120` | How long to wait for the peer bot's address before falling back to the manual prompt. |
 
-The shipped sample `config.toml` (in the repo root) has both role keys
-commented out with instructions; copy it and edit.
+The shipped sample `config.toml` (in the repo root) has both role keys and
+the `[telegram]` table commented out with instructions; copy it and edit.
 
 ## CLI reference
 
@@ -368,6 +439,9 @@ p2p-tunnel [OPTIONS]
 
 Options:
       --config <CONFIG>  Path to the TOML config file [default: ./config.toml]
+      --telegram         Negotiate the peer address via Telegram bot-to-bot
+                         (requires a `[telegram]` table in the config); falls
+                         back to the manual prompt on timeout/error
       --verbose          Enable debug logging (RUST_LOG takes precedence if set)
   -h, --help             Print help
   -V, --version          Print version
@@ -499,9 +573,11 @@ General debug moves:
 - **Simultaneous hole punching works best against *cone* NATs.** Symmetric
   NATs / CGNAT (common on mobile hotspots) will typically fail the punch
   within the timeout — a TURN relay fallback is on the roadmap.
-- **Manual address exchange, one tunnel per run.** No signaling channel, no
-  reconnect: if the QUIC connection drops or a machine restarts, re-run both
-  sides. Multiplexing refinements and resilience are future work.
+- **One tunnel per run.** No reconnect: if the QUIC connection drops or a
+  machine restarts, re-run both sides. Address exchange is manual by default
+  (or automatic via the optional Telegram bot-to-bot channel), but there is no
+  persistent signaling or re-handshake once a tunnel is down. Multiplexing
+  refinements and resilience are future work.
 - **One listen port and one target per side** (though concurrent
   *connections* through them are fully supported).
 - **MVP trust model** (accept-any cert) — see [Security model](#security-model).
@@ -553,7 +629,8 @@ probe client.
     ├── punch.rs               # hole punching loop
     ├── role.rs                # deterministic server/client decision
     ├── quic.rs                # certs, verifier, endpoint, connect/accept
-    └── tunnel.rs              # TCP↔QUIC bridges (client + server sides)
+    ├── tunnel.rs              # TCP↔QUIC bridges (client + server sides)
+    └── telegram.rs            # optional Telegram bot-to-bot address exchange
 ```
 
 The full development plan lives in `plan.md` (repo parent directory);
