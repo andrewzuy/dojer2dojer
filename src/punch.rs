@@ -102,6 +102,7 @@ mod tests {
             keep_alive_interval_secs: 5,
             local_tcp_listen_port: None,
             remote_target_addr: None,
+            telegram: None,
         }
     }
 

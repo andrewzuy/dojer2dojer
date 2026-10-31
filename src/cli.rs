@@ -12,6 +12,13 @@ pub struct Cli {
     /// Enable debug logging (RUST_LOG takes precedence if set).
     #[arg(long)]
     pub verbose: bool,
+    /// Use the Telegram bot-to-bot signaling channel to exchange public
+    /// addresses automatically (requires the `[telegram]` config table and
+    /// Bot-to-Bot Communication Mode enabled for both bots in @BotFather).
+    /// Falls back to the manual address prompt if the peer bot is not reached
+    /// within the timeout.
+    #[arg(long)]
+    pub telegram: bool,
 }
 
 /// Prompt on stdin for the peer's public address until valid input arrives.

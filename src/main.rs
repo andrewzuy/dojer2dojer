@@ -1,10 +1,4 @@
-mod cli;
-mod config;
-mod punch;
-mod quic;
-mod role;
-mod stun;
-mod tunnel;
+use p2p_tunnel_lib::{cli, config, punch, quic, role, stun, telegram, tunnel};
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -61,8 +55,12 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
     println!();
     println!("Your public address is: {public_addr}");
     println!("Give it to the other party, then enter their public address below.");
-    let peer_addr = cli::prompt_peer_addr()?;
-    info!(%peer_addr, "peer address entered");
+    // Address exchange: Telegram bot-to-bot (if --telegram) or the manual
+    // prompt. Telegram is a *second channel*, not a replacement — on any
+    // failure (bad token, bot-to-bot disabled, timeout) we fall back to the
+    // prompt so the tunnel can still be established manually.
+    let peer_addr = negotiate_peer_addr(&cli, &cfg, public_addr).await?;
+    info!(%peer_addr, "peer address resolved");
 
     punch::punch(&socket, peer_addr, &cfg)
         .instrument(tracing::info_span!("punch"))
@@ -133,6 +131,62 @@ async fn run(cli: cli::Cli) -> anyhow::Result<()> {
     }
     info!("tunnel closed; goodbye");
     Ok(())
+}
+
+/// Resolve the peer's public address.
+///
+/// With `--telegram` and a configured `[telegram]` table, exchange addresses
+/// over the bot-to-bot DM channel; on any failure fall back to the manual
+/// prompt so a bot misconfiguration never blocks a working tunnel.
+async fn negotiate_peer_addr(
+    cli: &cli::Cli,
+    cfg: &config::Config,
+    own_addr: SocketAddr,
+) -> anyhow::Result<SocketAddr> {
+    if !cli.telegram {
+        return cli::prompt_peer_addr();
+    }
+    let tg_cfg = match &cfg.telegram {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "--telegram was given but no `[telegram]` table exists in {} — \
+                 falling back to the manual address prompt.",
+                cli.config.display()
+            );
+            return cli::prompt_peer_addr();
+        }
+    };
+    let tg = match telegram::Telegram::new(tg_cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "Telegram signaling unavailable ({e:#}) — falling back to the manual address prompt."
+            );
+            return cli::prompt_peer_addr();
+        }
+    };
+
+    if let Err(e) = tg.send_own_addr(own_addr).await {
+        eprintln!("Could not send our address to the peer bot: {e:#}");
+        eprintln!("Falling back to the manual address prompt.");
+        return cli::prompt_peer_addr();
+    }
+
+    match tg.await_peer_addr(tg_cfg).await {
+        Ok(addr) => Ok(addr),
+        Err(telegram::TelegramError::Timeout { .. }) => {
+            eprintln!(
+                "Timed out waiting for the peer bot's address — falling back to the manual address prompt."
+            );
+            cli::prompt_peer_addr()
+        }
+        Err(e) => {
+            eprintln!("Telegram signaling failed: {e:#}");
+            eprintln!("Falling back to the manual address prompt.");
+            cli::prompt_peer_addr()
+        }
+    }
 }
 
 /// A short, actionable hint for the common failure modes.
