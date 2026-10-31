@@ -24,3 +24,8 @@ keep_alive_interval_secs = 5
 # Server side: where to forward incoming tunneled TCP traffic.
 # Uncomment on the machine that holds the target service.
 # remote_target_addr = "192.168.1.50:22"
+
+#[telegram]
+#token = "123456:ABC-DEF…"   # THIS machine's bot token
+#peer_bot_id = 987654321      # the PEER bot's numeric id
+# timeout_secs = 120         # optional; default 120
