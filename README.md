@@ -405,6 +405,11 @@ that:
   id), so the reply it receives isn't treated as a new peer.
 - It only accepts a `PTUN v1` payload from the **specific peer bot id**
   configured; messages from any other sender are discarded.
+- It **clears the stale backlog first.** `getUpdates` replays whatever is
+  already queued, so a `PTUN` line left over from a previous run would
+  otherwise be accepted as a (stale) peer address. On start, the client drains
+  the existing queue via the `offset` parameter and only considers messages
+  that arrive *after* it announces itself.
 
 The payload format is `PTUN v1 <ip:port>`; anything not matching that prefix
 is ignored. Role negotiation (server vs client) is unchanged and still

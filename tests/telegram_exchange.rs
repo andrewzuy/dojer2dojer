@@ -60,12 +60,12 @@ async fn telegram_exchange_against_mock_bot_api() {
     };
     let tg = Telegram::new(&cfg).expect("build client");
 
-    // 1. Announce our address.
+    // The exchange (clear stale backlog → send our addr → poll) happens
+    // inside `await_peer_addr`. The mock keeps a stale PTUN line in the
+    // queue; the client must drain it via offset and only accept the peer's
+    // *fresh* address, which the mock posts once it sees our send.
     let own: SocketAddr = "198.51.100.9:4433".parse().unwrap();
-    tg.send_own_addr(own).await.expect("send_own_addr");
-
-    // 2. Wait for the peer's address (mock returns it on the 2nd getUpdates).
-    let result = tokio::time::timeout(Duration::from_secs(10), tg.await_peer_addr(&cfg)).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), tg.await_peer_addr(&cfg, own)).await;
 
     let _ = mock.kill();
     let _ = mock.wait();

@@ -145,14 +145,29 @@ impl Telegram {
         Ok(())
     }
 
-    /// Long-poll `getUpdates` until the peer bot announces its address.
-    ///
-    /// Resolves with the peer's public address, or [`TelegramError::Timeout`]
-    /// after `cfg.timeout_secs`. The caller typically falls back to the
-    /// manual address prompt on timeout.
-    pub async fn await_peer_addr(&self, cfg: &TelegramConfig) -> Result<SocketAddr, TelegramError> {
+    /// Full exchange: clear the stale backlog, announce our address, then
+    /// long-poll `getUpdates` for the peer's. Resolves with the peer's public
+    /// address, or [`TelegramError::Timeout`] after `cfg.timeout_secs`. The
+    /// caller typically falls back to the manual address prompt on timeout.
+    pub async fn await_peer_addr(
+        &self,
+        cfg: &TelegramConfig,
+        own_addr: SocketAddr,
+    ) -> Result<SocketAddr, TelegramError> {
         let own_id = self
             .own_bot_id()
+            .await
+            .map_err(|e| TelegramError::Request(e.to_string()))?;
+
+        // Drop any messages already in the bot's update queue so that only
+        // addresses sent *after* this run starts are considered. Without this,
+        // a `PTUN` line left over from a previous session would be replayed
+        // by `getUpdates` and accepted as a (stale) peer address. This must
+        // happen BEFORE we announce ourselves: clearing the backlog and then
+        // sending our address guarantees the peer's reply is a *new* update.
+        let mut offset = self.reset_backlog().await?;
+
+        self.send_own_addr(own_addr)
             .await
             .map_err(|e| TelegramError::Request(e.to_string()))?;
 
@@ -177,7 +192,7 @@ impl Telegram {
 
             let res = tokio::time::timeout(
                 poll + Duration::from_secs(15), // client-side guard vs. a stuck read
-                self.fetch_updates(),
+                self.fetch_updates(offset),
             )
             .await;
 
@@ -194,10 +209,31 @@ impl Telegram {
             };
 
             for msg in updates {
+                // Track the highest update id we've seen so the next poll
+                // starts strictly after it — no re-delivery, no backlog.
+                offset = offset.max(msg.update_id + 1);
                 if let Some(addr) = self.classify(&msg, own_id) {
                     info!(%addr, "received the peer's address via Telegram");
                     return Ok(addr);
                 }
+            }
+        }
+    }
+
+    /// Consume and discard whatever is already in the update queue, returning
+    /// an `offset` past the newest existing update. This guarantees the
+    /// subsequent long-poll only sees messages that arrive during this run.
+    async fn reset_backlog(&self) -> Result<i64, TelegramError> {
+        let mut offset: i64 = 0;
+        loop {
+            let batch = self.fetch_updates(offset).await?;
+            if let Some(last) = batch.iter().map(|m| m.update_id).max() {
+                offset = last + 1;
+            }
+            // `getUpdates` returns at most 100 updates per call; keep draining
+            // until a batch comes back empty (nothing newer than `offset`).
+            if batch.is_empty() {
+                return Ok(offset);
             }
         }
     }
@@ -230,11 +266,15 @@ impl Telegram {
         }
     }
 
-    async fn fetch_updates(&self) -> Result<Vec<UpdateMessage>, TelegramError> {
+    async fn fetch_updates(&self, offset: i64) -> Result<Vec<UpdateMessage>, TelegramError> {
         let timeout = GET_UPDATES_TIMEOUT_SECS.to_string();
+        let offset_s = offset.to_string();
         // `result` of `getUpdates` is the array itself, so `T` is the vec.
-        self.call_with::<Vec<UpdateMessage>>("getUpdates", &[("timeout", timeout.as_str())])
-            .await
+        self.call_with::<Vec<UpdateMessage>>(
+            "getUpdates",
+            &[("timeout", timeout.as_str()), ("offset", offset_s.as_str())],
+        )
+        .await
     }
 
     async fn call_with<T>(&self, method: &str, fields: &[(&str, &str)]) -> Result<T, TelegramError>
@@ -289,6 +329,8 @@ impl Telegram {
 #[derive(Debug, Deserialize)]
 struct UpdateMessage {
     #[serde(default)]
+    update_id: i64,
+    #[serde(default)]
     message: Message,
 }
 
@@ -314,6 +356,7 @@ mod tests {
     /// Build a synthetic `getUpdates` entry for `classify` tests.
     fn msg(from_id: i64, is_bot: bool, text: &str) -> UpdateMessage {
         UpdateMessage {
+            update_id: 0,
             message: Message {
                 from: Some(ChatUser {
                     id: from_id,

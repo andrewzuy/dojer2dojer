@@ -167,13 +167,7 @@ async fn negotiate_peer_addr(
         }
     };
 
-    if let Err(e) = tg.send_own_addr(own_addr).await {
-        eprintln!("Could not send our address to the peer bot: {e:#}");
-        eprintln!("Falling back to the manual address prompt.");
-        return cli::prompt_peer_addr();
-    }
-
-    match tg.await_peer_addr(tg_cfg).await {
+    match tg.await_peer_addr(tg_cfg, own_addr).await {
         Ok(addr) => Ok(addr),
         Err(telegram::TelegramError::Timeout { .. }) => {
             eprintln!(
