@@ -9,4 +9,6 @@ pub mod quic;
 pub mod role;
 pub mod stun;
 pub mod telegram;
+pub mod tui;
+pub mod tui_state;
 pub mod tunnel;

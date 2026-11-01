@@ -6,6 +6,48 @@ then update this file. Implement phases self-contained from plan.md + this file 
 
 ## Done
 
+### Phase 3 — Live TUI (2026-11-01) ✅
+A full-screen live UI (ratatui 0.30 + crossterm 0.29, cross-platform, no native
+deps) that visualizes the whole tunnel lifecycle. Pure-async pipeline is
+unchanged — it now emits `TuiEvent`s through a `TuiHandle` (an `mpsc` sender,
+`Clone`); a dedicated **render thread** owns the terminal and folds events into
+`TuiState`, drawing on each tick.
+
+- **`src/tui_state.rs`** (new): `Phase` (Stun/Exchange/Punch/Role/Quic/Tunnel),
+  `PhaseStatus` (Pending/Active/Done/Error), `TuiState` (addresses, role,
+  fingerprint, port, target, bounded log, ready/done/error flags). `set_phase`
+  auto-completes any earlier still-Active phase so the stepper never shows two
+  actives. Unit-tested (phase transitions, frontier, log bounding).
+- **`src/tui.rs`** (new): `TuiEvent` enum + `apply_event` (pure fold),
+  `TuiHandle` (sender, or disabled no-op), `run_render_loop` (raw mode +
+  alternate screen, 60 ms poll, `q`/Esc to quit), and the draw functions:
+  header (title + status pill: idle/working/CONNECTED/ERROR), a phase stepper
+  (✓ / animated braille spinner / · / ✗, color-coded), a connection diagram
+  (own/peer addr, role, cert fingerprint), and a scrolling event log (tail-
+  pinned). State shared via a `LazyLock<Mutex<TuiState>>`.
+- **`src/main.rs`**: TUI auto-enabled when `std::io::stdout().is_tty()`
+  (crossterm `IsTty`), overridable with `--tui` / `--no-tui`. When active,
+  `tracing` is set to `off` (TUI is the single source of truth; avoids
+  stderr/alternate-screen interleaving) and the raw `error:`/`hint` block is
+  suppressed (the TUI paints it red; still exits 1). Pipeline emits events at
+  every stage (STUN done, exchange, punch, role, cert fingerprint, ready, done,
+  errors) via `handle.clone()` into `run()`. Error path sleeps ~3 s so the
+  render loop can paint before exit.
+- **`src/cli.rs`**: `--tui`, `--no-tui` flags.
+- **Verified:** `cargo test` = 39 passing (36 prior + 3 new `tui_state`),
+  `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean.
+  Smoke-tested the TUI under a PTY (`script -qec`): header/lifecycle/connection/
+  events panels render, spinner animates, error turns header red and fills the
+  events panel, terminal restored on exit. Non-TTY (piped) and `--no-tui` paths
+  produce the original plain logging + `error:` + `hint:` unchanged (no
+  regression). `--help` lists the new flags.
+
+**Note for CI / musl:** ratatui + crossterm are pure Rust (crossterm uses
+`rustix`/`libc` on unix, `winapi` on Windows) and build fine in the musl static
+profile — no new native toolchain requirements.
+
+### Phase 3 — Telegram signaling (2026-07-12) ✅
+
 ### Phase 0 — Project Skeleton ✅
 - Modules: main, config, stun, punch, role, quic, tunnel, cli.
 - Deps: tokio(full), clap(derive), serde(derive), toml, tracing, tracing-subscriber(env-filter),

@@ -12,6 +12,7 @@ Type one address into the other machine, and a normal TCP tool (`ssh`,
 - **Simultaneous UDP hole punching** opens the NAT hole
 - **QUIC / TLS 1.3** (quinn) carries an encrypted, reliable byte pipe over the hole
 - A **TCP↔QUIC stream bridge** turns the pipe into ordinary TCP connections
+- A **live TUI** (ratatui + crossterm) visualizes the whole lifecycle — phase stepper, connection diagram, and scrolling event log — and auto-enables on any real terminal
 
 ```
 ┌────────────────────────┐                         ┌────────────────────────┐
@@ -447,14 +448,50 @@ Options:
       --telegram         Negotiate the peer address via Telegram bot-to-bot
                          (requires a `[telegram]` table in the config); falls
                          back to the manual prompt on timeout/error
+      --tui              Show the live terminal UI (auto-enabled on a TTY)
+      --no-tui           Force the plain log output, even on a TTY
       --verbose          Enable debug logging (RUST_LOG takes precedence if set)
   -h, --help             Print help
   -V, --version          Print version
 ```
 
-Logging levels: `info` by default (the lines shown in the quick start),
-`--verbose` or `RUST_LOG=debug` for per-packet/per-round detail (every punch
-packet sent, every ignored non-peer packet, STUN round timing, …).
+**Live TUI.** When stdout is a real terminal the app runs a full-screen UI
+(ratatui + crossterm) that visualizes the whole lifecycle:
+
+```
+┌ p2p-tunnel ──────────────────────────────────────────────────────────┐
+┌ lifecycle ───────────────────────────────────────────────────────────┐
+│ ✓ STUN ── ⠹ EXCHANGE ── · PUNCH ── · ROLE ── · QUIC ── · TUNNEL      │
+└──────────────────────────────────────────────────────────────────────┘
+┌ connection ──────────────────────────────────────────────────────────┐
+│  you   185.235.254.56:33710                                          │
+│  peer  141.98.10.63:62771                                           │
+│  role  client      cert  9a4f1c2e…b7d0                                │
+└──────────────────────────────────────────────────────────────────────┘
+┌ events ──────────────────────────────────────────────────────────────┐
+│ own public address: 185.235.254.56:33710                            │
+│ peer address: 141.98.10.63:62771                                    │
+│ role: client                                                        │
+└──────────────────────────────────────────────────────────────────────┘
+ working on: EXCHANGE — waiting for peer    q to abort
+```
+
+The stepper fills in as each phase completes (✓ done, animated spinner
+active, · pending, ✗ error), the connection panel shows both public
+addresses, the chosen role, and the fresh cert fingerprint, and the events
+panel is a scrolling log. The header turns green on `CONNECTED` and red on
+error (which also fills the events panel). Press **`q`** or **Esc** to
+abort. It's auto-enabled only when stdout is a TTY — when piped or redirected
+the original plain logging is used, and `--no-tui` forces that path while
+`--tui` forces the UI (handy for testing). When the TUI is active, `tracing`
+logging is silenced so the stderr formatter never interleaves with the
+alternate screen; the TUI is the single source of truth. `RUST_LOG` is
+ignored in that case (the TUI is the output).
+
+Logging levels (non-TUI path): `info` by default (the lines shown in the
+quick start), `--verbose` or `RUST_LOG=debug` for per-packet/per-round
+detail (every punch packet sent, every ignored non-peer packet, STUN round
+timing, …).
 
 On success the process exits 0 when the tunnel ends; on failure it prints
 `error: <details>` plus an actionable `hint:` line to stderr and exits 1.

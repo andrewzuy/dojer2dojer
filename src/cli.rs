@@ -19,6 +19,12 @@ pub struct Cli {
     /// within the timeout.
     #[arg(long)]
     pub telegram: bool,
+    /// Show the live terminal UI (auto-enabled when attached to a TTY).
+    #[arg(long)]
+    pub tui: bool,
+    /// Force the plain log output, even when attached to a TTY.
+    #[arg(long)]
+    pub no_tui: bool,
 }
 
 /// Prompt on stdin for the peer's public address until valid input arrives.
