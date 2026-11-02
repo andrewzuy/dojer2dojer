@@ -27,20 +27,23 @@ pub struct Cli {
     pub no_tui: bool,
 }
 
-/// Prompt on stdin for the peer's public address until valid input arrives.
+/// Read the peer's public address from the user, re-prompting until valid.
 ///
-/// One-shot interactive prompt: briefly blocking the async runtime on stdin is
-/// acceptable here (the main thread is otherwise idle waiting for input).
-pub fn prompt_peer_addr() -> anyhow::Result<SocketAddr> {
-    use std::io::Write;
+/// `read` is a closure that returns the next line of user input (`None` on
+/// EOF). Injecting it keeps this function pure and testable; the caller
+/// (`main.rs`) supplies either a plain `stdin` read or the TUI's inline
+/// prompt (which temporarily leaves raw mode so the terminal's line
+/// discipline works).
+///
+/// One-shot interactive prompt: briefly blocking the async runtime on input
+/// is acceptable here (the pipeline is otherwise idle waiting for this).
+pub fn prompt_peer_addr(
+    read: &mut dyn FnMut() -> std::io::Result<Option<String>>,
+) -> anyhow::Result<SocketAddr> {
     loop {
-        print!("Enter peer's public address (ip:port): ");
-        std::io::stdout().flush()?;
-        let mut line = String::new();
-        let n = std::io::stdin().read_line(&mut line)?;
-        if n == 0 {
+        let Some(line) = read()? else {
             anyhow::bail!("no input received (stdin closed)");
-        }
+        };
         let line = line.trim();
         if line.is_empty() {
             eprintln!("Address cannot be empty, please try again.");

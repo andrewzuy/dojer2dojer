@@ -225,6 +225,15 @@ async fn run(cli: cli::Cli, ui: TuiHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read one line of user input through the active transport.
+///
+/// TUI on: `ui.ask_line` hands the prompt to the render loop, which drops
+/// raw mode, reads a line with the terminal's normal line discipline, and
+/// re-enters raw mode. TUI off: plain `read_line` on stdin.
+fn read_line(ui: &TuiHandle, prompt: &str) -> std::io::Result<Option<String>> {
+    ui.ask_line(prompt)
+}
+
 /// Resolve the peer's public address.
 ///
 /// With `--telegram` and a configured `[telegram]` table, exchange addresses
@@ -236,35 +245,32 @@ async fn negotiate_peer_addr(
     own_addr: SocketAddr,
     ui: &TuiHandle,
 ) -> anyhow::Result<SocketAddr> {
+    let mut read = || read_line(ui, "Enter peer's public address (ip:port): ");
     if !cli.telegram {
-        return cli::prompt_peer_addr();
+        return cli::prompt_peer_addr(&mut read);
     }
     let tg_cfg = match &cfg.telegram {
         Some(c) => c,
         None => {
-            eprintln!(
+            let msg = format!(
                 "--telegram was given but no `[telegram]` table exists in {} — \
                  falling back to the manual address prompt.",
                 cli.config.display()
             );
-            ui.emit(TuiEvent::Log(
-                tui::LogLevel::Warn,
-                "no [telegram] table — manual prompt".into(),
-            ));
-            return cli::prompt_peer_addr();
+            eprintln!("{msg}");
+            ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
+            return cli::prompt_peer_addr(&mut read);
         }
     };
     let tg = match telegram::Telegram::new(tg_cfg) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!(
+            let msg = format!(
                 "Telegram signaling unavailable ({e:#}) — falling back to the manual address prompt."
             );
-            ui.emit(TuiEvent::Log(
-                tui::LogLevel::Warn,
-                format!("telegram unavailable ({e:#}) — manual prompt"),
-            ));
-            return cli::prompt_peer_addr();
+            eprintln!("{msg}");
+            ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
+            return cli::prompt_peer_addr(&mut read);
         }
     };
 
@@ -275,14 +281,10 @@ async fn negotiate_peer_addr(
     match tg.await_peer_addr(tg_cfg, own_addr).await {
         Ok(addr) => Ok(addr),
         Err(telegram::TelegramError::Timeout { .. }) => {
-            eprintln!(
-                "Timed out waiting for the peer bot's address — falling back to the manual address prompt."
-            );
-            ui.emit(TuiEvent::Log(
-                tui::LogLevel::Warn,
-                "telegram timed out — manual prompt".into(),
-            ));
-            cli::prompt_peer_addr()
+            let msg = "Timed out waiting for the peer bot's address — falling back to the manual address prompt.".to_string();
+            eprintln!("{msg}");
+            ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
+            cli::prompt_peer_addr(&mut read)
         }
         Err(e) => {
             eprintln!("Telegram signaling failed: {e:#}");
@@ -291,7 +293,7 @@ async fn negotiate_peer_addr(
                 tui::LogLevel::Warn,
                 format!("telegram failed ({e:#}) — manual prompt"),
             ));
-            cli::prompt_peer_addr()
+            cli::prompt_peer_addr(&mut read)
         }
     }
 }

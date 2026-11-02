@@ -11,7 +11,16 @@
 //! The TUI is opt-in (`--tui`) and also auto-enabled when stdout is a TTY and
 //! `--no-tui` is not given. When the TUI is off, the plain `tracing` log path
 //! runs exactly as before — there is no regression.
+//!
+//! **Interactive prompt (the address-exchange fallback).** The TUI owns the
+//! terminal in raw mode, so a plain `read_line` from the pipeline would eat
+//! raw bytes and the prompt would never appear. Instead the pipeline emits
+//! [`TuiEvent::Prompt`]; the render loop takes the terminal out of raw mode,
+//! draws a prompt line, reads a line from the user, re-enters raw mode, and
+//! replies with [`TuiEvent::PromptResponse`]. This keeps the "type the peer's
+//! address" path working even while the TUI is up.
 
+use std::io::Write;
 use std::sync::mpsc;
 
 use crossterm::{
@@ -55,6 +64,20 @@ pub enum TuiEvent {
     Done(String),
     /// A fatal error occurred.
     Error(String),
+    /// The pipeline needs a line of text from the user. The render loop
+    /// pauses the raw-mode event loop, reads a line, and replies with
+    /// [`TuiEvent::PromptResponse`].
+    Prompt {
+        prompt: String,
+        reply_tx: mpsc::Sender<String>,
+    },
+    /// Render-loop side of [`TuiEvent::Prompt`] — the user's line (empty on
+    /// EOF). Not emitted by the pipeline; used only by the render loop itself.
+    #[allow(dead_code)]
+    PromptResponse {
+        reply_tx: mpsc::Sender<String>,
+        line: String,
+    },
 }
 
 /// Severity of a log line, mapping to a color in the UI.
@@ -94,6 +117,41 @@ impl TuiHandle {
     pub fn is_disabled(&self) -> bool {
         self.tx.is_none()
     }
+
+    /// Ask the user for a line of text and return it.
+    ///
+    /// TUI active: hands the request to the render loop, which reads from the
+    /// terminal with the normal (cooked) line discipline and replies on the
+    /// mpsc. Pipeline blocked meanwhile is fine — the pipeline is otherwise
+    /// idle waiting for this input.
+    ///
+    /// TUI disabled: a plain blocking `read_line` on stdin, exactly as before.
+    ///
+    /// Returns `Ok(None)` on EOF (stdin closed / Ctrl-D) and `Err` on I/O
+    /// errors.
+    pub fn ask_line(&self, prompt: &str) -> std::io::Result<Option<String>> {
+        if let Some(tx) = &self.tx {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            tx.send(TuiEvent::Prompt {
+                prompt: prompt.to_string(),
+                reply_tx,
+            })
+            .map_err(|_| std::io::Error::other("TUI render loop has exited"))?;
+            match reply_rx.recv() {
+                Ok(line) => Ok(Some(line)),
+                Err(_) => Ok(None),
+            }
+        } else {
+            print!("{prompt}");
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            let n = std::io::stdin().read_line(&mut line)?;
+            if n == 0 {
+                return Ok(None);
+            }
+            Ok(Some(line))
+        }
+    }
 }
 
 /// Construct a channel pair: the pipeline keeps `TuiHandle`, the render loop
@@ -106,6 +164,9 @@ pub fn channel() -> (TuiHandle, mpsc::Receiver<TuiEvent>) {
 // ── State application ────────────────────────────────────────────────────
 
 /// Fold one event into the shared state (pure — no terminal I/O).
+///
+/// `TuiEvent::Prompt`/`PromptResponse` are transport-only and carry no
+/// renderable state; they are ignored here.
 ///
 /// Splitting this out from the render loop makes it unit-testable.
 pub fn apply_event(state: &mut TuiState, ev: TuiEvent) {
@@ -150,6 +211,7 @@ pub fn apply_event(state: &mut TuiState, ev: TuiEvent) {
             state.error = true;
             state.push_log(LogLevel::Error, msg);
         }
+        TuiEvent::Prompt { .. } | TuiEvent::PromptResponse { .. } => {}
     }
 }
 
@@ -163,16 +225,24 @@ pub fn run_render_loop(rx: mpsc::Receiver<TuiEvent>) -> std::io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    let mut quit = false;
     loop {
-        // Drain any pending events before drawing, and bump the spinner tick.
-        let mut quit = false;
-        {
-            let mut state = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-            state.tick = state.tick.wrapping_add(1);
-            while let Ok(ev) = rx.try_recv() {
-                apply_event(&mut state, ev);
+        // Drain any pending events before drawing. A `Prompt` request is
+        // handled inline (it blocks until the user types a line); everything
+        // else is folded into state.
+        let mut state = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        state.tick = state.tick.wrapping_add(1);
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                TuiEvent::Prompt { prompt, reply_tx } => {
+                    drop(state); // release the lock while we touch the terminal
+                    prompt_line(&prompt, &reply_tx);
+                    state = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+                }
+                other => apply_event(&mut state, other),
             }
         }
+        drop(state);
 
         // Draw, then poll the terminal with a short timeout so we stay
         // responsive to keyboard input without busy-spinning.
@@ -200,6 +270,48 @@ pub fn run_render_loop(rx: mpsc::Receiver<TuiEvent>) -> std::io::Result<()> {
     terminal.show_cursor()?;
 
     Ok(())
+}
+
+/// Read one line from the user while the TUI is otherwise in raw mode.
+///
+/// Drops raw mode so the terminal's line discipline (backspace, Enter,
+/// Ctrl-D) works normally, prints the prompt to the real terminal, reads one
+/// line, then restores raw mode. The reply is sent on `reply_tx` so the
+/// blocked pipeline can continue; if the pipeline has already gone (channel
+/// closed) we just swallow the result.
+fn prompt_line(prompt: &str, reply_tx: &mpsc::Sender<String>) {
+    let result: std::io::Result<Option<String>> = (|| {
+        disable_raw_mode()?;
+        let mut stdout = std::io::stdout();
+        // Give the alternate-screen layout a clean bottom edge for the prompt.
+        stdout.flush()?;
+        writeln!(stdout, " {prompt}").or_else(|e| {
+            enable_raw_mode()?;
+            Err(e)
+        })?;
+        stdout.flush().or_else(|e| {
+            enable_raw_mode()?;
+            Err(e)
+        })?;
+        let mut line = String::new();
+        let n = std::io::stdin().read_line(&mut line).or_else(|e| {
+            enable_raw_mode()?;
+            Err(e)
+        })?;
+        enable_raw_mode()?;
+        if n == 0 { Ok(None) } else { Ok(Some(line)) }
+    })();
+
+    match result {
+        Ok(v) => {
+            let _ = reply_tx.send(v.unwrap_or_default());
+        }
+        Err(e) => {
+            // Report the failure as an empty line; the pipeline treats empty
+            // input as "no input received" and bails with a clear error.
+            let _ = reply_tx.send(format!("\n{e:?}"));
+        }
+    }
 }
 
 // A process-lifetime state holder so the render loop and a (future) keyboard
