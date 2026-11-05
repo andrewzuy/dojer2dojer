@@ -23,6 +23,16 @@
 //! PTUN v1 <ip:port>
 //! ```
 //!
+//! **Stale-announcement handling.** Each side announces exactly once at the
+//! start of its exchange, so the *newest* `PTUN` line in the bot's update
+//! queue is the peer's most recent announcement — even if it was sent by an
+//! earlier run of the peer (a few minutes ago, while we were still starting
+//! up). We therefore never clear the queue; we track the highest `update_id`
+//! consumed and accept any peer line younger than [`MAX_ADDR_AGE_SECS`]. A
+//! line older than that (an announcement from before the NAT mapping we are
+//! about to punch through) is ignored, so a stale address can't silently
+//! break hole-punching.
+//!
 //! **Loop prevention** (the docs warn bots must terminate predictably):
 //! - we only ever *send* our own address — never a reaction to an incoming
 //!   bot message;
@@ -42,9 +52,18 @@ use crate::config::TelegramConfig;
 /// Marker line format shared with the peer: `PTUN v1 <ip:port>`.
 const PAYLOAD_PREFIX: &str = "PTUN v1 ";
 
-/// `getUpdates` long-poll window. Telegram holds the request up to 50 s; 30 s
-/// leaves headroom under client-side read timeouts and re-polls quickly.
-const GET_UPDATES_TIMEOUT_SECS: u64 = 30;
+/// `getUpdates` long-poll window. Telegram holds the request up to 50 s; a
+/// shorter window means the exchange loop wakes more often, so user aborts
+/// (Ctrl-C / `q` in the TUI) take effect within seconds instead of up to
+/// 30.
+const GET_UPDATES_TIMEOUT_SECS: u64 = 10;
+
+/// A `PTUN` announcement older than this is ignored as stale: the NAT
+/// mapping it refers to is almost certainly gone, so acting on it would only
+/// burn the punch timeout. (Ten minutes comfortably covers two machines being
+/// started a few minutes apart while staying well under typical NAT
+/// idle-timeout × keep-alive windows.)
+const MAX_ADDR_AGE_SECS: i64 = 600;
 
 /// Base URL of the Bot API. Overridable via `PTUN_TELEGRAM_API_BASE` for
 /// tests against a mock server (e.g. `http://127.0.0.1:8931`).
@@ -66,35 +85,53 @@ pub enum TelegramError {
     Api(String),
     #[error("peer bot {peer_bot_id} did not announce its address within {timeout_secs}s")]
     Timeout { peer_bot_id: i64, timeout_secs: u64 },
+    #[error("aborted by the user")]
+    Aborted,
 }
 
 /// Handle for the bot-to-bot signaling exchange.
+///
+/// Stateful: `own_bot_id` is resolved once at construction and `seen` tracks
+/// the highest `update_id` consumed, so re-polling never replays messages.
 pub struct Telegram {
     client: reqwest::Client,
     token: String,
     /// User id of the peer's bot (the `chat_id` we send to).
     peer_bot_id: i64,
+    /// Our own bot's numeric id (from `getMe`), so incoming echoes of our own
+    /// sends can be recognized and ignored.
+    own_bot_id: Option<i64>,
+    /// Next `getUpdates` offset: one past the highest `update_id` seen.
+    seen: i64,
 }
 
 impl Telegram {
-    /// Build a signaling handle. `peer_bot_id` is the numeric id of the other
-    /// party's bot (a bot's own id is what `getMe.id` returns).
-    pub fn new(cfg: &TelegramConfig) -> anyhow::Result<Self> {
+    /// Build a signaling handle and identify our own bot (`getMe`).
+    /// `cfg.peer_bot_id` is the numeric id of the other party's bot (a bot's
+    /// own id is what `getMe.id` returns).
+    pub async fn init(cfg: &TelegramConfig) -> anyhow::Result<Self> {
         let token = cfg.token.trim().to_string();
         anyhow::ensure!(
             !token.is_empty(),
             "config: `[telegram].token` must not be empty"
         );
         let client = reqwest::Client::builder()
-            // The long poll can be held ~30 s by the server; allow generous
+            // The long poll can be held ~10 s by the server; allow generous
             // read time, no overall request timeout.
             .read_timeout(Duration::from_secs(GET_UPDATES_TIMEOUT_SECS + 30))
             .build()
             .context("building HTTPS client for api.telegram.org")?;
-        Ok(Self {
+        let tg = Self {
             client,
             token,
             peer_bot_id: cfg.peer_bot_id,
+            own_bot_id: None,
+            seen: 0,
+        };
+        let own_bot_id = tg.own_bot_id().await?;
+        Ok(Self {
+            own_bot_id: Some(own_bot_id),
+            ..tg
         })
     }
 
@@ -120,13 +157,14 @@ impl Telegram {
         Ok(id)
     }
 
-    /// Ask the peer bot to send us its address.
+    /// Announce our address to the peer bot.
     ///
-    /// We cannot send the address to the peer directly *and* wait for theirs
-    /// in one shot — the peer only learns *our* address after it starts. The
-    /// protocol is simply: each side sends its own `PTUN v1 <addr>` line to
-    /// the peer bot on startup; each side waits for the peer's line. The
-    /// messages cross in flight and both sides proceed.
+    /// The protocol is simply: each side sends its own `PTUN v1 <addr>` line
+    /// to the peer bot at the start of the exchange; each side waits for the
+    /// peer's line. The messages cross in flight and both sides proceed. A
+    /// peer that already announced in a previous run needs no re-send: its
+    /// line is still in the queue and (if fresh) is accepted by
+    /// [`wait_peer_addr`](Self::wait_peer_addr).
     pub async fn send_own_addr(&self, own_addr: SocketAddr) -> anyhow::Result<()> {
         let text = format!("{PAYLOAD_PREFIX}{own_addr}");
         let chat_id = self.peer_bot_id.to_string();
@@ -145,41 +183,40 @@ impl Telegram {
         Ok(())
     }
 
-    /// Full exchange: clear the stale backlog, announce our address, then
-    /// long-poll `getUpdates` for the peer's. Resolves with the peer's public
-    /// address, or [`TelegramError::Timeout`] after `cfg.timeout_secs`. The
-    /// caller typically falls back to the manual address prompt on timeout.
-    pub async fn await_peer_addr(
-        &self,
+    /// Wait for the peer's address: long-poll `getUpdates` and accept the
+    /// peer bot's `PTUN` line, provided it is fresh (younger than
+    /// [`MAX_ADDR_AGE_SECS`]) and not an echo of our own send.
+    ///
+    /// Resolves with the peer's public address, [`TelegramError::Timeout`] after
+    /// `cfg.timeout_secs`, or [`TelegramError::Aborted`] as soon as
+    /// `is_aborted()` returns true (checked before and after every poll, so a
+    /// user abort lands within one short poll window).
+    ///
+    /// The queue is *not* cleared on entry: the newest peer line already in
+    /// the queue may be exactly the one we want (the peer started first and
+    /// has been waiting for us). Staleness is decided by the message `date`,
+    /// not by when this process started.
+    pub async fn wait_peer_addr(
+        &mut self,
         cfg: &TelegramConfig,
-        own_addr: SocketAddr,
+        is_aborted: impl Fn() -> bool + Send,
     ) -> Result<SocketAddr, TelegramError> {
-        let own_id = self
-            .own_bot_id()
-            .await
-            .map_err(|e| TelegramError::Request(e.to_string()))?;
-
-        // Drop any messages already in the bot's update queue so that only
-        // addresses sent *after* this run starts are considered. Without this,
-        // a `PTUN` line left over from a previous session would be replayed
-        // by `getUpdates` and accepted as a (stale) peer address. This must
-        // happen BEFORE we announce ourselves: clearing the backlog and then
-        // sending our address guarantees the peer's reply is a *new* update.
-        let mut offset = self.reset_backlog().await?;
-
-        self.send_own_addr(own_addr)
-            .await
-            .map_err(|e| TelegramError::Request(e.to_string()))?;
+        let own_id = self.own_bot_id.ok_or_else(|| {
+            TelegramError::Request("Telegram::init must be called before waiting".into())
+        })?;
 
         let timeout = Duration::from_secs(cfg.timeout_secs);
         let deadline = tokio::time::Instant::now() + timeout;
         info!(
             peer_bot_id = self.peer_bot_id,
             timeout_secs = cfg.timeout_secs,
-            "waiting for the peer bot's address (you can press Ctrl-C to cancel)"
+            "waiting for the peer bot's address (q / Esc / Ctrl-C to cancel)"
         );
 
         loop {
+            if is_aborted() {
+                return Err(TelegramError::Aborted);
+            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(TelegramError::Timeout {
@@ -192,7 +229,7 @@ impl Telegram {
 
             let res = tokio::time::timeout(
                 poll + Duration::from_secs(15), // client-side guard vs. a stuck read
-                self.fetch_updates(offset),
+                self.fetch_updates(),
             )
             .await;
 
@@ -210,8 +247,10 @@ impl Telegram {
 
             for msg in updates {
                 // Track the highest update id we've seen so the next poll
-                // starts strictly after it — no re-delivery, no backlog.
-                offset = offset.max(msg.update_id + 1);
+                // starts strictly after it — no re-delivery.
+                if msg.update_id + 1 > self.seen {
+                    self.seen = msg.update_id + 1;
+                }
                 if let Some(addr) = self.classify(&msg, own_id) {
                     info!(%addr, "received the peer's address via Telegram");
                     return Ok(addr);
@@ -220,27 +259,10 @@ impl Telegram {
         }
     }
 
-    /// Consume and discard whatever is already in the update queue, returning
-    /// an `offset` past the newest existing update. This guarantees the
-    /// subsequent long-poll only sees messages that arrive during this run.
-    async fn reset_backlog(&self) -> Result<i64, TelegramError> {
-        let mut offset: i64 = 0;
-        loop {
-            let batch = self.fetch_updates(offset).await?;
-            if let Some(last) = batch.iter().map(|m| m.update_id).max() {
-                offset = last + 1;
-            }
-            // `getUpdates` returns at most 100 updates per call; keep draining
-            // until a batch comes back empty (nothing newer than `offset`).
-            if batch.is_empty() {
-                return Ok(offset);
-            }
-        }
-    }
-
-    /// If this message is the peer bot's `PTUN v1 <addr>` line, return the
-    /// address. Own-bot echoes and non-payload messages are ignored (loop
-    /// prevention — we never reply to bot messages).
+    /// If this message is a *fresh* `PTUN v1 <addr>` line from the peer bot,
+    /// return the address. Own-bot echoes, other senders, malformed payloads
+    /// and stale announcements are ignored (loop prevention — we never reply
+    /// to bot messages).
     fn classify(&self, msg: &UpdateMessage, own_id: i64) -> Option<SocketAddr> {
         let text = msg.message.text.as_deref()?;
         let body = text.trim().strip_prefix(PAYLOAD_PREFIX)?;
@@ -257,6 +279,25 @@ impl Telegram {
             );
             return None;
         }
+        // Reject announcements older than MAX_ADDR_AGE_SECS: the NAT mapping
+        // behind that address is almost certainly gone, and acting on it
+        // would only burn the whole punch timeout. `date` is unix seconds
+        // (Telegram server time); a missing date (0) is treated as "unknown"
+        // and accepted rather than deadlocking the exchange.
+        if msg.message.date > 0 {
+            let age = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+                - msg.message.date;
+            if age > MAX_ADDR_AGE_SECS {
+                warn!(
+                    age_secs = age,
+                    "ignoring stale PTUN announcement (older than {MAX_ADDR_AGE_SECS}s)"
+                );
+                return None;
+            }
+        }
         match crate::cli::parse_peer_addr(body) {
             Ok(addr) => Some(addr),
             Err(e) => {
@@ -266,9 +307,9 @@ impl Telegram {
         }
     }
 
-    async fn fetch_updates(&self, offset: i64) -> Result<Vec<UpdateMessage>, TelegramError> {
+    async fn fetch_updates(&self) -> Result<Vec<UpdateMessage>, TelegramError> {
         let timeout = GET_UPDATES_TIMEOUT_SECS.to_string();
-        let offset_s = offset.to_string();
+        let offset_s = self.seen.to_string();
         // `result` of `getUpdates` is the array itself, so `T` is the vec.
         self.call_with::<Vec<UpdateMessage>>(
             "getUpdates",
@@ -340,6 +381,10 @@ struct Message {
     from: Option<ChatUser>,
     #[serde(default)]
     text: Option<String>,
+    /// Unix timestamp (seconds) when Telegram delivered the message; 0 for
+    /// synthetic test messages (treated as "unknown age" — accepted).
+    #[serde(default)]
+    date: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,6 +408,7 @@ mod tests {
                     is_bot,
                 }),
                 text: text.to_string().into(),
+                date: 0, // unknown age -> accepted, like a dateless test message
             },
         }
     }
@@ -374,6 +420,23 @@ mod tests {
             client: reqwest::Client::new(),
             token: "test-token".into(),
             peer_bot_id,
+            own_bot_id: Some(1001),
+            seen: 0,
+        }
+    }
+
+    /// A `getUpdates` entry with an explicit `date` (unix seconds).
+    fn msg_at(from_id: i64, is_bot: bool, text: &str, date: i64) -> UpdateMessage {
+        UpdateMessage {
+            update_id: 0,
+            message: Message {
+                from: Some(ChatUser {
+                    id: from_id,
+                    is_bot,
+                }),
+                text: text.to_string().into(),
+                date,
+            },
         }
     }
 
@@ -455,6 +518,43 @@ mod tests {
         assert_eq!(
             tg.classify(&msg(9001, true, "PTUN v1 not-an-addr"), own_id),
             None
+        );
+    }
+
+    #[test]
+    fn classify_accepts_fresh_peer_payload() {
+        let tg = tg_for_test(9001);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let m = msg_at(9001, true, "PTUN v1 10.1.2.3:4321", now - 5);
+        assert_eq!(
+            tg.classify(&m, 1001),
+            Some("10.1.2.3:4321".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn classify_rejects_stale_peer_payload() {
+        let tg = tg_for_test(9001);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // An hour-old announcement: the NAT mapping is long gone.
+        let m = msg_at(9001, true, "PTUN v1 10.1.2.3:4321", now - 3600);
+        assert_eq!(tg.classify(&m, 1001), None);
+    }
+
+    #[test]
+    fn classify_accepts_payload_without_date() {
+        // A missing `date` (0) must not deadlock the exchange.
+        let tg = tg_for_test(9001);
+        let m = msg_at(9001, true, "PTUN v1 10.1.2.3:4321", 0);
+        assert_eq!(
+            tg.classify(&m, 1001),
+            Some("10.1.2.3:4321".parse().unwrap())
         );
     }
 }

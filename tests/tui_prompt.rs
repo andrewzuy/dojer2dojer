@@ -17,7 +17,7 @@
 
 use p2p_tunnel_lib::cli;
 use p2p_tunnel_lib::tui;
-use p2p_tunnel_lib::tui::{TuiEvent, TuiHandle};
+use p2p_tunnel_lib::tui::{PromptOutcome, TuiEvent, TuiHandle};
 use std::io::Result as IoResult;
 use std::sync::mpsc;
 use std::thread;
@@ -28,7 +28,7 @@ fn fake_render(rx: mpsc::Receiver<TuiEvent>, lines: Vec<String>) {
         loop {
             match rx.recv() {
                 Ok(TuiEvent::Prompt { reply_tx, .. }) => {
-                    let _ = reply_tx.send(line);
+                    let _ = reply_tx.send(PromptOutcome::Line(line));
                     break;
                 }
                 Ok(_) => continue,
@@ -40,7 +40,7 @@ fn fake_render(rx: mpsc::Receiver<TuiEvent>, lines: Vec<String>) {
 
 #[test]
 fn tui_prompt_round_trips_through_handle() {
-    let (handle, rx) = tui::channel();
+    let (handle, rx, _, _) = tui::channel();
     // First line is bad input (exercises the retry loop in prompt_peer_addr),
     // second is valid.
     let lines = vec!["not-an-address".into(), "1.2.3.4:9999".into()];
@@ -56,12 +56,12 @@ fn tui_prompt_round_trips_through_handle() {
 
 #[test]
 fn tui_prompt_receiver_gone_fails_cleanly() {
-    let (handle, rx) = tui::channel();
+    let (handle, rx, _, _) = tui::channel();
     // Simulate the render loop exiting (user pressed q) while the pipeline
     // is about to ask for input: the receiver is dropped, so ask_line's
     // send must fail rather than hang.
     drop(rx);
-    let res: IoResult<Option<String>> = handle.ask_line("Enter peer's public address (ip:port): ");
+    let res: IoResult<PromptOutcome> = handle.ask_line("Enter peer's public address (ip:port): ");
     assert!(
         res.is_err(),
         "ask_line must error when the render loop is gone"

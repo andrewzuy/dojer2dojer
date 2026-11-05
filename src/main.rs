@@ -1,4 +1,4 @@
-use p2p_tunnel_lib::{cli, config, punch, quic, role, stun, telegram, tui, tunnel};
+use p2p_tunnel_lib::{cli, config, punch, quic, role, stun, telegram, tui, tui_state, tunnel};
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -25,15 +25,17 @@ async fn main() {
         std::io::stdout().is_tty()
     };
 
-    // TUI setup: build the event channel and spawn the render loop on its own
-    // thread (it owns the terminal, which is blocking I/O). When the TUI is off,
-    // the handle is a no-op and we just run the plain log path.
+    // TUI setup: build the event channel plus the shared state (exchange mode
+    // + aborted flag) that both the pipeline and the render loop touch, then
+    // spawn the render loop on its own thread (it owns the terminal, which is
+    // blocking I/O). When the TUI is off, the handle is a no-op and we just
+    // run the plain log path.
     let handle = if use_tui {
-        let (handle, rx) = tui::channel();
+        let (handle, rx, mode, aborted) = tui::channel();
         std::thread::Builder::new()
             .name("tui".into())
             .spawn(move || {
-                let _ = tui::run_render_loop(rx);
+                let _ = tui::run_render_loop(rx, mode, aborted);
             })
             .expect("spawn TUI render thread");
         handle
@@ -219,6 +221,12 @@ async fn run(cli: cli::Cli, ui: TuiHandle) -> anyhow::Result<()> {
                 .await?;
         }
     }
+    if ui.aborted() {
+        // The user pressed q/Esc/Ctrl-C while the tunnel was running; the
+        // render loop has already torn the UI down, so just stop cleanly.
+        info!("tunnel aborted by the user");
+        return Ok(());
+    }
     info!("tunnel closed; goodbye");
     ui.emit(TuiEvent::Phase(Phase::Tunnel, PhaseStatus::Done));
     ui.emit(TuiEvent::Done("tunnel closed; goodbye".into()));
@@ -227,73 +235,132 @@ async fn run(cli: cli::Cli, ui: TuiHandle) -> anyhow::Result<()> {
 
 /// Read one line of user input through the active transport.
 ///
-/// TUI on: `ui.ask_line` hands the prompt to the render loop, which drops
-/// raw mode, reads a line with the terminal's normal line discipline, and
-/// re-enters raw mode. TUI off: plain `read_line` on stdin.
-fn read_line(ui: &TuiHandle, prompt: &str) -> std::io::Result<Option<String>> {
+/// TUI on: `ui.ask_line` hands the prompt to the render loop, which shows an
+/// inline editor (the TUI keeps drawing while the user types) and reports
+/// the outcome — a submitted line, a `t` mode-toggle, an abort, or EOF.
+/// TUI off: plain `read_line` on stdin (line, or EOF).
+fn read_line(ui: &TuiHandle, prompt: &str) -> std::io::Result<tui::PromptOutcome> {
     ui.ask_line(prompt)
 }
 
-/// Resolve the peer's public address.
+/// Resolve the peer's public address, following the *current* exchange mode.
 ///
-/// With `--telegram` and a configured `[telegram]` table, exchange addresses
-/// over the bot-to-bot DM channel; on any failure fall back to the manual
-/// prompt so a bot misconfiguration never blocks a working tunnel.
+/// The mode is shared with the TUI: the `t` key toggles it at any time (when
+/// Telegram is available), so this function loops — waiting on Telegram in
+/// Telegram mode, showing the manual prompt in manual mode — until one of
+/// them yields an address. `--telegram` only chooses the *initial* mode; a
+/// Telegram failure (bad token, missing config, timeout) or a toggle falls
+/// through to the manual prompt so a bot misconfiguration never blocks a
+/// working tunnel. Aborts (q/Esc/Ctrl-C) stop the run.
 async fn negotiate_peer_addr(
     cli: &cli::Cli,
     cfg: &config::Config,
     own_addr: SocketAddr,
     ui: &TuiHandle,
 ) -> anyhow::Result<SocketAddr> {
-    let mut read = || read_line(ui, "Enter peer's public address (ip:port): ");
-    if !cli.telegram {
-        return cli::prompt_peer_addr(&mut read);
+    // Initial mode: `--telegram` starts in Telegram mode when a `[telegram]`
+    // table exists; the TUI `t` key can switch back and forth afterwards.
+    let telegram_available = cli.telegram && cfg.telegram.is_some();
+    ui.emit(TuiEvent::TelegramChannel(telegram_available));
+    if telegram_available {
+        ui.set_exchange_mode(tui_state::ExchangeMode::Telegram);
     }
-    let tg_cfg = match &cfg.telegram {
-        Some(c) => c,
-        None => {
-            let msg = format!(
-                "--telegram was given but no `[telegram]` table exists in {} — \
-                 falling back to the manual address prompt.",
-                cli.config.display()
-            );
-            eprintln!("{msg}");
-            ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
-            return cli::prompt_peer_addr(&mut read);
-        }
-    };
-    let tg = match telegram::Telegram::new(tg_cfg) {
-        Ok(t) => t,
-        Err(e) => {
-            let msg = format!(
-                "Telegram signaling unavailable ({e:#}) — falling back to the manual address prompt."
-            );
-            eprintln!("{msg}");
-            ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
-            return cli::prompt_peer_addr(&mut read);
-        }
-    };
 
-    ui.emit(TuiEvent::Log(
-        tui::LogLevel::Info,
-        "waiting for peer bot address over Telegram…".into(),
-    ));
-    match tg.await_peer_addr(tg_cfg, own_addr).await {
-        Ok(addr) => Ok(addr),
-        Err(telegram::TelegramError::Timeout { .. }) => {
-            let msg = "Timed out waiting for the peer bot's address — falling back to the manual address prompt.".to_string();
-            eprintln!("{msg}");
-            ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
-            cli::prompt_peer_addr(&mut read)
+    let tg_cfg = cfg.telegram.as_ref();
+    let mut tg: Option<telegram::Telegram> = None;
+    let mut read = || read_line(ui, "Enter peer's public address (ip:port): ");
+
+    loop {
+        if ui.aborted() {
+            return Err(anyhow::anyhow!("aborted by the user"));
         }
-        Err(e) => {
-            eprintln!("Telegram signaling failed: {e:#}");
-            eprintln!("Falling back to the manual address prompt.");
-            ui.emit(TuiEvent::Log(
-                tui::LogLevel::Warn,
-                format!("telegram failed ({e:#}) — manual prompt"),
-            ));
-            cli::prompt_peer_addr(&mut read)
+        let mode = ui.exchange_mode();
+
+        if mode == tui_state::ExchangeMode::Telegram {
+            // Lazily initialize the signaling client (getMe) on first entry.
+            if tg.is_none() {
+                let Some(tg_cfg) = tg_cfg else {
+                    // Can't happen (the flag is only set when configured),
+                    // but degrade gracefully.
+                    ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
+                    continue;
+                };
+                match telegram::Telegram::init(tg_cfg).await {
+                    Ok(t) => {
+                        ui.emit(TuiEvent::Log(
+                            tui::LogLevel::Info,
+                            "waiting for the peer bot's address over Telegram…".into(),
+                        ));
+                        tg = Some(t);
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "Telegram signaling unavailable ({e:#}) — falling back to the manual address prompt."
+                        );
+                        eprintln!("{msg}");
+                        ui.emit(TuiEvent::TelegramChannel(false));
+                        ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
+                        ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
+                        continue;
+                    }
+                }
+            }
+            let Some(tg) = tg.as_mut() else { continue };
+            let Some(tg_cfg) = tg_cfg else { continue };
+
+            // Announce our address every time we (re-)enter Telegram mode, so
+            // a peer that started after our first send still sees it.
+            if let Err(e) = tg.send_own_addr(own_addr).await {
+                let msg = format!(
+                    "Telegram signaling failed ({e:#}) — falling back to the manual address prompt."
+                );
+                eprintln!("{msg}");
+                ui.emit(TuiEvent::TelegramChannel(false));
+                ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
+                ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
+                continue;
+            }
+
+            match tg.wait_peer_addr(tg_cfg, || ui.aborted()).await {
+                Ok(addr) => return Ok(addr),
+                Err(telegram::TelegramError::Aborted) => {
+                    return Err(anyhow::anyhow!("aborted by the user"));
+                }
+                Err(telegram::TelegramError::Timeout { .. }) => {
+                    let msg = "Timed out waiting for the peer bot's address — switching to the manual address prompt (press t to try Telegram again).".to_string();
+                    eprintln!("{msg}");
+                    ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
+                    ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
+                    continue;
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "Telegram signaling failed ({e:#}) — switching to the manual address prompt."
+                    );
+                    eprintln!("{msg}");
+                    ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
+                    ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
+                    continue;
+                }
+            }
+        }
+
+        // Manual mode.
+        match cli::prompt_peer_addr(&mut read) {
+            Ok(addr) => return Ok(addr),
+            Err(cli::PromptBail::ModeToggled) => {
+                // The user pressed `t` mid-prompt: loop back and wait on
+                // Telegram (the render loop already flipped the shared flag).
+                continue;
+            }
+            Err(cli::PromptBail::Aborted) => {
+                return Err(anyhow::anyhow!("aborted by the user"));
+            }
+            Err(cli::PromptBail::Eof) => {
+                return Err(anyhow::anyhow!(
+                    "stdin closed before a peer address was entered"
+                ));
+            }
         }
     }
 }

@@ -15,10 +15,14 @@
 //! **Interactive prompt (the address-exchange fallback).** The TUI owns the
 //! terminal in raw mode, so a plain `read_line` from the pipeline would eat
 //! raw bytes and the prompt would never appear. Instead the pipeline emits
-//! [`TuiEvent::Prompt`]; the render loop takes the terminal out of raw mode,
-//! draws a prompt line, reads a line from the user, re-enters raw mode, and
-//! replies with [`TuiEvent::PromptResponse`]. This keeps the "type the peer's
-//! address" path working even while the TUI is up.
+//! [`TuiEvent::Prompt`]; the render loop switches to an inline line editor
+//! (the UI keeps rendering, the user's input is visible at the bottom) and
+//! replies with a [`PromptOutcome`]: the submitted line, a mode toggle (the
+//! `t` key switches manual ⇄ Telegram), or an abort (`q`/Esc/Ctrl-C).
+//!
+//! **Keyboard.** Outside a prompt: `q`/Esc/Ctrl-C aborts the whole run (a
+//! shared flag tells the pipeline to stop), and `t` switches the
+//! address-exchange mode when a Telegram channel is configured.
 
 use std::io::Write;
 use std::sync::mpsc;
@@ -35,7 +39,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use crate::tui_state::{Phase, PhaseStatus, TuiState};
+use crate::tui_state::{ExchangeMode, Phase, PhaseStatus, TuiState};
 
 /// A single progress message the pipeline reports to the TUI.
 ///
@@ -65,19 +69,28 @@ pub enum TuiEvent {
     /// A fatal error occurred.
     Error(String),
     /// The pipeline needs a line of text from the user. The render loop
-    /// pauses the raw-mode event loop, reads a line, and replies with
-    /// [`TuiEvent::PromptResponse`].
+    /// switches to the inline prompt editor and replies with the outcome on
+    /// `reply_tx` (a submitted line, a mode toggle, or an abort).
     Prompt {
         prompt: String,
-        reply_tx: mpsc::Sender<String>,
+        reply_tx: mpsc::Sender<PromptOutcome>,
     },
-    /// Render-loop side of [`TuiEvent::Prompt`] — the user's line (empty on
-    /// EOF). Not emitted by the pipeline; used only by the render loop itself.
-    #[allow(dead_code)]
-    PromptResponse {
-        reply_tx: mpsc::Sender<String>,
-        line: String,
-    },
+    /// A working Telegram channel exists (or not) — the render loop shows or
+    /// hides the `[t]` mode-toggle hint accordingly.
+    TelegramChannel(bool),
+}
+
+/// The outcome of an interactive prompt, sent back to the pipeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptOutcome {
+    /// The user submitted a line (may be empty; the caller validates).
+    Line(String),
+    /// The user pressed `t` to switch the address-exchange mode.
+    ModeToggled,
+    /// The user aborted the prompt (`q` / Esc / Ctrl-C).
+    Aborted,
+    /// stdin was closed (EOF; the non-TUI path only).
+    Eof,
 }
 
 /// Severity of a log line, mapping to a color in the UI.
@@ -91,17 +104,34 @@ pub enum LogLevel {
 
 /// A thread-safe handle the pipeline holds to report progress.
 ///
-/// Wraps the mpsc sender; cloning is cheap and the sender can be dropped when
-/// the TUI is off (a `None` handle emits nothing).
+/// Wraps the mpsc sender plus two flags shared with the render loop:
+/// the current exchange mode (flipped by the `t` key) and an abort flag
+/// (set when the user quits outside a prompt). Cloning is cheap and the
+/// sender can be dropped when the TUI is off (a `None` handle emits nothing).
 #[derive(Clone)]
 pub struct TuiHandle {
     tx: Option<mpsc::Sender<TuiEvent>>,
+    mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TuiHandle {
-    /// A no-op handle used when the TUI is disabled.
+    /// A no-op handle used when the TUI is disabled. Stays in manual mode and
+    /// is never aborted (there is no render loop to do either).
     pub fn disabled() -> Self {
-        Self { tx: None }
+        Self {
+            tx: None,
+            mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(ExchangeMode::MANUAL_BITS)),
+            aborted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub fn new(tx: mpsc::Sender<TuiEvent>) -> Self {
+        Self {
+            tx: Some(tx),
+            mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(ExchangeMode::MANUAL_BITS)),
+            aborted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
     pub fn emit(&self, ev: TuiEvent) {
@@ -118,18 +148,46 @@ impl TuiHandle {
         self.tx.is_none()
     }
 
-    /// Ask the user for a line of text and return it.
+    /// The shared render-loop side of this handle's flags.
+    pub fn render_side(
+        &self,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicU8>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        (self.mode.clone(), self.aborted.clone())
+    }
+
+    /// The current address-exchange mode (manual or Telegram).
+    pub fn exchange_mode(&self) -> ExchangeMode {
+        ExchangeMode::from_bits(self.mode.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Set the exchange mode (also used when the user presses `t`).
+    pub fn set_exchange_mode(&self, mode: ExchangeMode) {
+        self.mode
+            .store(mode.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the user has asked to abort (pressed `q`/Esc/Ctrl-C outside a
+    /// prompt). The pipeline checks this between phases and at the end of
+    /// every Telegram polling iteration so the run actually stops.
+    pub fn aborted(&self) -> bool {
+        self.aborted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Ask the user for a line of text and return the outcome.
     ///
-    /// TUI active: hands the request to the render loop, which reads from the
-    /// terminal with the normal (cooked) line discipline and replies on the
-    /// mpsc. Pipeline blocked meanwhile is fine — the pipeline is otherwise
-    /// idle waiting for this input.
+    /// TUI active: hands the request to the render loop, which switches to
+    /// the inline prompt editor and replies on the mpsc. Pipeline blocked
+    /// meanwhile is fine — the pipeline is otherwise idle waiting for this
+    /// input.
     ///
     /// TUI disabled: a plain blocking `read_line` on stdin, exactly as before.
     ///
-    /// Returns `Ok(None)` on EOF (stdin closed / Ctrl-D) and `Err` on I/O
-    /// errors.
-    pub fn ask_line(&self, prompt: &str) -> std::io::Result<Option<String>> {
+    /// Returns [`PromptOutcome::Eof`] on EOF (stdin closed / Ctrl-D) and
+    /// `Err` on I/O errors.
+    pub fn ask_line(&self, prompt: &str) -> std::io::Result<PromptOutcome> {
         if let Some(tx) = &self.tx {
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(TuiEvent::Prompt {
@@ -138,8 +196,8 @@ impl TuiHandle {
             })
             .map_err(|_| std::io::Error::other("TUI render loop has exited"))?;
             match reply_rx.recv() {
-                Ok(line) => Ok(Some(line)),
-                Err(_) => Ok(None),
+                Ok(outcome) => Ok(outcome),
+                Err(_) => Ok(PromptOutcome::Aborted),
             }
         } else {
             print!("{prompt}");
@@ -147,26 +205,33 @@ impl TuiHandle {
             let mut line = String::new();
             let n = std::io::stdin().read_line(&mut line)?;
             if n == 0 {
-                return Ok(None);
+                return Ok(PromptOutcome::Eof);
             }
-            Ok(Some(line))
+            Ok(PromptOutcome::Line(line))
         }
     }
 }
 
-/// Construct a channel pair: the pipeline keeps `TuiHandle`, the render loop
-/// receives from the `Receiver`.
-pub fn channel() -> (TuiHandle, mpsc::Receiver<TuiEvent>) {
+/// Construct the channel pair: the pipeline keeps `TuiHandle`, the render
+/// loop receives from the `Receiver` plus the shared mode/abort flags.
+pub fn channel() -> (
+    TuiHandle,
+    mpsc::Receiver<TuiEvent>,
+    std::sync::Arc<std::sync::atomic::AtomicU8>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     let (tx, rx) = mpsc::channel();
-    (TuiHandle { tx: Some(tx) }, rx)
+    let handle = TuiHandle::new(tx);
+    let (mode, aborted) = handle.render_side();
+    (handle, rx, mode, aborted)
 }
 
 // ── State application ────────────────────────────────────────────────────
 
 /// Fold one event into the shared state (pure — no terminal I/O).
 ///
-/// `TuiEvent::Prompt`/`PromptResponse` are transport-only and carry no
-/// renderable state; they are ignored here.
+/// `TuiEvent::Prompt` is transport-only and carries no renderable state; it
+/// is ignored here.
 ///
 /// Splitting this out from the render loop makes it unit-testable.
 pub fn apply_event(state: &mut TuiState, ev: TuiEvent) {
@@ -211,13 +276,30 @@ pub fn apply_event(state: &mut TuiState, ev: TuiEvent) {
             state.error = true;
             state.push_log(LogLevel::Error, msg);
         }
-        TuiEvent::Prompt { .. } | TuiEvent::PromptResponse { .. } => {}
+        TuiEvent::TelegramChannel(available) => {
+            state.telegram_available = available;
+            if available {
+                state.push_log(
+                    LogLevel::Info,
+                    "telegram channel ready — press [t] to switch address-exchange mode".into(),
+                );
+            }
+        }
+        TuiEvent::Prompt { .. } => {}
     }
 }
 
 /// The render loop. Owns the terminal until the pipeline signals `Done`/`Error`
-/// or the user presses `q`/`Esc`.
-pub fn run_render_loop(rx: mpsc::Receiver<TuiEvent>) -> std::io::Result<()> {
+/// or the user quits (`q`/Esc/Ctrl-C, which also sets `aborted` so the
+/// pipeline stops).
+///
+/// `mode` is the shared exchange-mode flag (flipped by the `t` key); `aborted`
+/// is set when the user quits outside a prompt.
+pub fn run_render_loop(
+    rx: mpsc::Receiver<TuiEvent>,
+    mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
     // Terminal setup.
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -228,15 +310,19 @@ pub fn run_render_loop(rx: mpsc::Receiver<TuiEvent>) -> std::io::Result<()> {
     let mut quit = false;
     loop {
         // Drain any pending events before drawing. A `Prompt` request is
-        // handled inline (it blocks until the user types a line); everything
+        // handled inline (it blocks until the user submits/aborts); everything
         // else is folded into state.
         let mut state = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         state.tick = state.tick.wrapping_add(1);
+        state.exchange_mode =
+            ExchangeMode::from_bits(mode.load(std::sync::atomic::Ordering::Relaxed));
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 TuiEvent::Prompt { prompt, reply_tx } => {
                     drop(state); // release the lock while we touch the terminal
-                    prompt_line(&prompt, &reply_tx);
+                    let available = terminal_state_telegram();
+                    let outcome = prompt_editor(&mut terminal, &prompt, &mode, available);
+                    let _ = reply_tx.send(outcome);
                     state = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
                 }
                 other => apply_event(&mut state, other),
@@ -248,14 +334,41 @@ pub fn run_render_loop(rx: mpsc::Receiver<TuiEvent>) -> std::io::Result<()> {
         // responsive to keyboard input without busy-spinning.
         terminal.draw(draw)?;
 
-        if crossterm::event::poll(std::time::Duration::from_millis(60))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                        quit = true;
-                    }
+        let key_event = match crossterm::event::poll(std::time::Duration::from_millis(60))? {
+            true => event::read()?,
+            false => continue,
+        };
+        if let Event::Key(key) = key_event {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let quit_key = matches!(
+                key.code,
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc
+            ) || ctrl_c(&key);
+            if quit_key {
+                // q / Esc / Ctrl-C: abort the run, not just the UI.
+                if !terminal_state_done() {
+                    aborted.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                _ => {}
+                quit = true;
+            } else if matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+                && terminal_state_telegram()
+                && !terminal_state_done()
+            {
+                let cur = ExchangeMode::from_bits(mode.load(std::sync::atomic::Ordering::Relaxed));
+                let next = if cur == ExchangeMode::Telegram {
+                    ExchangeMode::Manual
+                } else {
+                    ExchangeMode::Telegram
+                };
+                mode.store(next.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                let mut s = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+                s.exchange_mode = next;
+                s.push_log(
+                    LogLevel::Info,
+                    format!("address exchange mode: {}", next.as_str()),
+                );
             }
         }
 
@@ -272,46 +385,68 @@ pub fn run_render_loop(rx: mpsc::Receiver<TuiEvent>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Read one line from the user while the TUI is otherwise in raw mode.
-///
-/// Drops raw mode so the terminal's line discipline (backspace, Enter,
-/// Ctrl-D) works normally, prints the prompt to the real terminal, reads one
-/// line, then restores raw mode. The reply is sent on `reply_tx` so the
-/// blocked pipeline can continue; if the pipeline has already gone (channel
-/// closed) we just swallow the result.
-fn prompt_line(prompt: &str, reply_tx: &mpsc::Sender<String>) {
-    let result: std::io::Result<Option<String>> = (|| {
-        disable_raw_mode()?;
-        let mut stdout = std::io::stdout();
-        // Give the alternate-screen layout a clean bottom edge for the prompt.
-        stdout.flush()?;
-        writeln!(stdout, " {prompt}").or_else(|e| {
-            enable_raw_mode()?;
-            Err(e)
-        })?;
-        stdout.flush().or_else(|e| {
-            enable_raw_mode()?;
-            Err(e)
-        })?;
-        let mut line = String::new();
-        let n = std::io::stdin().read_line(&mut line).or_else(|e| {
-            enable_raw_mode()?;
-            Err(e)
-        })?;
-        enable_raw_mode()?;
-        if n == 0 { Ok(None) } else { Ok(Some(line)) }
-    })();
-
-    match result {
-        Ok(v) => {
-            let _ = reply_tx.send(v.unwrap_or_default());
+/// Inline line editor used while a prompt is active. The UI keeps rendering
+/// (the input is drawn at the bottom), so the user always sees what they are
+/// typing. Keys: printable/space append, Backspace deletes, Enter submits,
+/// `t` toggles the exchange mode (when Telegram is available), `q`/Esc/Ctrl-C
+/// abort.
+fn prompt_editor(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    prompt: &str,
+    mode: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    telegram_available: bool,
+) -> PromptOutcome {
+    let mut input = String::new();
+    let outcome = loop {
+        // Show the prompt + current input while we wait for the next key.
+        {
+            let mut s = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+            s.prompt = Some((prompt.to_string(), input.clone()));
         }
-        Err(e) => {
-            // Report the failure as an empty line; the pipeline treats empty
-            // input as "no input received" and bails with a clear error.
-            let _ = reply_tx.send(format!("\n{e:?}"));
+        if terminal.draw(draw).is_err() {
+            break PromptOutcome::Aborted;
         }
-    }
+        let key_event = match event::read() {
+            Ok(e) => e,
+            Err(_) => break PromptOutcome::Aborted,
+        };
+        let Event::Key(key) = key_event else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Enter => break PromptOutcome::Line(std::mem::take(&mut input)),
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                break PromptOutcome::Aborted;
+            }
+            KeyCode::Char('c') if ctrl_c(&key) => break PromptOutcome::Aborted,
+            KeyCode::Char('t') | KeyCode::Char('T') if telegram_available => {
+                let cur = ExchangeMode::from_bits(mode.load(std::sync::atomic::Ordering::Relaxed));
+                let next = if cur == ExchangeMode::Telegram {
+                    ExchangeMode::Manual
+                } else {
+                    ExchangeMode::Telegram
+                };
+                mode.store(next.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                break PromptOutcome::ModeToggled;
+            }
+            KeyCode::Char(c) if c.is_ascii_graphic() || c == ' ' => {
+                input.push(c);
+            }
+            _ => {}
+        }
+    };
+    // Clear the prompt line and reflect any mode change before the regular
+    // render resumes.
+    let mut s = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    s.prompt = None;
+    s.exchange_mode = ExchangeMode::from_bits(mode.load(std::sync::atomic::Ordering::Relaxed));
+    outcome
 }
 
 // A process-lifetime state holder so the render loop and a (future) keyboard
@@ -325,6 +460,20 @@ fn terminal_state_done() -> bool {
     s.done
 }
 
+fn terminal_state_telegram() -> bool {
+    let s = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    s.telegram_available
+}
+
+/// True for a Ctrl-C key event (in raw mode the terminal does not translate
+/// it to SIGINT; we handle it ourselves).
+fn ctrl_c(key: &crossterm::event::KeyEvent) -> bool {
+    key.code == crossterm::event::KeyCode::Char('c')
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+}
+
 // ── Drawing ──────────────────────────────────────────────────────────────
 
 fn draw(f: &mut Frame) {
@@ -333,20 +482,46 @@ fn draw(f: &mut Frame) {
         .unwrap_or_else(|p| p.into_inner())
         .clone();
     let area = f.area();
+    let prompt_active = state.prompt.is_some();
 
-    // Three vertical regions: header, body (diagram + log), footer.
+    // Four vertical regions: header, body (diagram + log), footer (the footer
+    // grows by one line while a prompt is active, to host the input line).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(8),    // body
-            Constraint::Length(1), // footer
+            Constraint::Length(3),                                 // header
+            Constraint::Min(8),                                    // body
+            Constraint::Min(1),                                    // footer hints
+            Constraint::Length(if prompt_active { 1 } else { 0 }), // input line
         ])
         .split(area);
 
     draw_header(f, chunks[0], &state);
     draw_body(f, chunks[1], &state);
     draw_footer(f, chunks[2], &state);
+    if prompt_active {
+        draw_prompt_line(f, chunks[3], &state);
+    }
+}
+
+/// The prompt + live input line, drawn at the very bottom while a prompt is
+/// active. The area is one line tall; the input follows the prompt text with
+/// a blinking cursor. (ratatui clips overlong content at character
+/// boundaries, so no manual truncation is needed.)
+fn draw_prompt_line(f: &mut Frame, area: Rect, state: &TuiState) {
+    let (prompt, input) = state.prompt.as_ref().expect("checked by draw");
+    let cursor = if state.tick.is_multiple_of(2) {
+        "▏"
+    } else {
+        " "
+    };
+    let line = Line::from(vec![
+        Span::styled(" › ", Style::default().cyan().bold()),
+        Span::styled(prompt.clone(), Style::default().bold()),
+        Span::raw(input.clone()),
+        Span::styled(cursor.to_string(), Style::default().cyan()),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, state: &TuiState) {
@@ -493,6 +668,12 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &TuiState) {
         String::from(" session ended ")
     } else if state.ready {
         String::from(" CONNECTED — traffic flowing ")
+    } else if state.telegram_available {
+        format!(
+            " [{}: {}]",
+            phase_label(state.active_phase()),
+            state.exchange_mode.as_str()
+        )
     } else {
         format!(" working on: {} ", phase_label(state.active_phase()))
     };
@@ -501,7 +682,13 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &TuiState) {
     } else if state.ready {
         String::from(" q to tear down ")
     } else {
-        String::from(" q to abort ")
+        // Offer the mode toggle only while a working Telegram channel exists
+        // and the address exchange is not over.
+        if state.telegram_available && state.peer_addr.is_none() {
+            String::from(" [t] toggle mode · q to abort ")
+        } else {
+            String::from(" q to abort ")
+        }
     };
     let line = Line::from(vec![
         Span::styled(left, Style::default().dark_gray().italic()),

@@ -3,8 +3,8 @@
 Serves the three endpoints the client uses:
   POST /bot<token>/getMe          -> ok, result {id: OWN_ID}
   POST /bot<token>/sendMessage    -> ok, result {...}  (logs the payload)
-  POST /bot<token>/getUpdates     -> first call: empty; after that: the
-                                     preconfigured peer message, then empty.
+  POST /bot<token>/getUpdates     -> the preconfigured queue, filtered by
+                                     the offset the client passes.
 
 Run: python3 tests/telegram/mock_bot_api.py <port>
 """
@@ -12,31 +12,37 @@ import http.server
 import json
 import sys
 import threading
+import time
+
+NOW = int(time.time())
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8931
 OWN_ID = 1001          # this bot's id (echo sender)
 PEER_ID = 9001         # the peer bot's id
 PEER_ADDR = "203.0.113.7:48000"
 
-# Stale messages already in the queue when the run starts. The client must
-# drain and discard these (via offset) and never treat them as a fresh peer
-# address — this is the regression the backlog-reset fix addresses.
+# Stale message already in the queue when the run starts: an announcement
+# from an hour ago (a previous run of the peer). The client must reject it
+# as stale by `date` — its NAT mapping is long gone — and never treat it as
+# a fresh peer address. (Real Telegram messages always carry a `date`.)
 STALE = [
     {"update_id": 100, "message": {
         "message_id": 1,
         "from": {"id": PEER_ID, "is_bot": True, "username": "peer_bot"},
         "chat": {"id": OWN_ID, "type": "private"},
+        "date": NOW - 3600,   # an hour old: past MAX_ADDR_AGE_SECS
         "text": "PTUN v1 99.99.99.99:1",   # stale, must be ignored
     }},
 ]
 # The peer's fresh address arrives *after* the run starts. Its update_id is
-# strictly higher than every stale one (real Telegram ids are monotonic), so
-# it survives the client's backlog reset and is the one that must be accepted.
+# strictly higher than every stale one (real Telegram ids are monotonic) and
+# its date is current, so it is the one that must be accepted.
 FRESH = {
     "update_id": 102, "message": {
         "message_id": 2,
         "from": {"id": PEER_ID, "is_bot": True, "username": "peer_bot"},
         "chat": {"id": OWN_ID, "type": "private"},
+        "date": NOW,
         "text": f"PTUN v1 {PEER_ADDR}",
     }
 }
@@ -46,6 +52,7 @@ ECHO = {
         "message_id": 3,
         "from": {"id": OWN_ID, "is_bot": True, "username": "own_bot"},
         "chat": {"id": PEER_ID, "type": "private"},
+        "date": NOW,
         "text": "PTUN v1 198.51.100.9:4433",
     }
 }

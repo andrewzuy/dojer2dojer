@@ -58,14 +58,21 @@ async fn telegram_exchange_against_mock_bot_api() {
         peer_bot_id: 9001,
         timeout_secs: 15,
     };
-    let tg = Telegram::new(&cfg).expect("build client");
+    let mut tg = Telegram::init(&cfg).await.expect("build client");
 
-    // The exchange (clear stale backlog → send our addr → poll) happens
-    // inside `await_peer_addr`. The mock keeps a stale PTUN line in the
-    // queue; the client must drain it via offset and only accept the peer's
-    // *fresh* address, which the mock posts once it sees our send.
+    // The exchange (send our addr → poll) is `send_own_addr` +
+    // `wait_peer_addr`. The mock keeps a stale PTUN line in the queue;
+    // the client must skip it via its `update_id` offset and reject it as
+    // stale by `date`, accepting only the peer's *fresh* address, which
+    // the mock posts once it sees our send.
     let own: SocketAddr = "198.51.100.9:4433".parse().unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(10), tg.await_peer_addr(&cfg, own)).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        tg.send_own_addr(own).await?;
+        tg.wait_peer_addr(&cfg, || false)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    })
+    .await;
 
     let _ = mock.kill();
     let _ = mock.wait();
@@ -74,11 +81,11 @@ async fn telegram_exchange_against_mock_bot_api() {
     let got = match result {
         Ok(r) => r.unwrap_or_else(|e| {
             eprintln!("--- mock log ---\n{mock_log}\n--- end mock log ---");
-            panic!("await_peer_addr failed: {e:#}")
+            panic!("address exchange failed: {e:#}")
         }),
         Err(_) => {
             eprintln!("--- mock log ---\n{mock_log}\n--- end mock log ---");
-            panic!("await_peer_addr hung")
+            panic!("address exchange hung")
         }
     };
     assert_eq!(got, "203.0.113.7:48000".parse::<SocketAddr>().unwrap());

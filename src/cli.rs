@@ -2,6 +2,8 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::tui;
+
 /// P2P NAT-traversal tunnel over QUIC.
 #[derive(Debug, Parser)]
 #[command(name = "p2p-tunnel", version, about)]
@@ -12,11 +14,12 @@ pub struct Cli {
     /// Enable debug logging (RUST_LOG takes precedence if set).
     #[arg(long)]
     pub verbose: bool,
-    /// Use the Telegram bot-to-bot signaling channel to exchange public
-    /// addresses automatically (requires the `[telegram]` config table and
-    /// Bot-to-Bot Communication Mode enabled for both bots in @BotFather).
-    /// Falls back to the manual address prompt if the peer bot is not reached
-    /// within the timeout.
+    /// Start in Telegram address-exchange mode: the bots DM each other's
+    /// public addresses automatically (requires the `[telegram]` config table
+    /// and Bot-to-Bot Communication Mode enabled for both bots in @BotFather).
+    /// With the TUI you can switch back and forth with the `t` key at any
+    /// time; if the peer is not reached within the timeout the manual address
+    /// prompt is offered.
     #[arg(long)]
     pub telegram: bool,
     /// Show the live terminal UI (auto-enabled when attached to a TTY).
@@ -27,22 +30,34 @@ pub struct Cli {
     pub no_tui: bool,
 }
 
+/// Why [`prompt_peer_addr`] stopped without producing an address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptBail {
+    /// The user switched the address-exchange mode mid-prompt (the `t` key).
+    ModeToggled,
+    /// The user aborted the prompt (q / Esc / Ctrl-C).
+    Aborted,
+    /// stdin was closed (EOF).
+    Eof,
+}
+
 /// Read the peer's public address from the user, re-prompting until valid.
 ///
-/// `read` is a closure that returns the next line of user input (`None` on
-/// EOF). Injecting it keeps this function pure and testable; the caller
-/// (`main.rs`) supplies either a plain `stdin` read or the TUI's inline
-/// prompt (which temporarily leaves raw mode so the terminal's line
-/// discipline works).
+/// `read` is a closure returning the next user-input outcome. Injecting it
+/// keeps this function pure and testable; the caller (`main.rs`) supplies
+/// either a plain `stdin` read or the TUI's inline prompt editor.
 ///
 /// One-shot interactive prompt: briefly blocking the async runtime on input
 /// is acceptable here (the pipeline is otherwise idle waiting for this).
 pub fn prompt_peer_addr(
-    read: &mut dyn FnMut() -> std::io::Result<Option<String>>,
-) -> anyhow::Result<SocketAddr> {
+    read: &mut dyn FnMut() -> std::io::Result<tui::PromptOutcome>,
+) -> Result<SocketAddr, PromptBail> {
     loop {
-        let Some(line) = read()? else {
-            anyhow::bail!("no input received (stdin closed)");
+        let line = match read().map_err(|_| PromptBail::Aborted)? {
+            tui::PromptOutcome::Line(line) => line,
+            tui::PromptOutcome::ModeToggled => return Err(PromptBail::ModeToggled),
+            tui::PromptOutcome::Aborted => return Err(PromptBail::Aborted),
+            tui::PromptOutcome::Eof => return Err(PromptBail::Eof),
         };
         let line = line.trim();
         if line.is_empty() {

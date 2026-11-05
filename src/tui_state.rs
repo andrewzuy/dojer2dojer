@@ -26,6 +26,44 @@ pub enum PhaseStatus {
     Error,
 }
 
+/// How the peer's public address is being resolved (the Exchange phase).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExchangeMode {
+    /// The user types the peer's address at the prompt.
+    #[default]
+    Manual,
+    /// The Telegram bots DM each other's addresses.
+    Telegram,
+}
+
+impl ExchangeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExchangeMode::Manual => "manual",
+            ExchangeMode::Telegram => "telegram",
+        }
+    }
+
+    /// Wire format for the mode flag shared between the pipeline and the
+    /// render loop (`AtomicU8` is not generic over enums).
+    pub const MANUAL_BITS: u8 = 0;
+    pub const TELEGRAM_BITS: u8 = 1;
+
+    pub fn to_bits(self) -> u8 {
+        match self {
+            ExchangeMode::Manual => Self::MANUAL_BITS,
+            ExchangeMode::Telegram => Self::TELEGRAM_BITS,
+        }
+    }
+
+    pub fn from_bits(b: u8) -> Self {
+        match b {
+            Self::TELEGRAM_BITS => ExchangeMode::Telegram,
+            _ => ExchangeMode::Manual,
+        }
+    }
+}
+
 /// The full UI state. `Clone` so the draw function can snapshot it cheaply.
 #[derive(Clone, Debug, Default)]
 pub struct TuiState {
@@ -43,6 +81,15 @@ pub struct TuiState {
     pub logs: Vec<(LogLevel, String)>,
     /// Advances on each render tick to drive the spinner.
     pub tick: u32,
+    /// The current address-exchange mode (mirrored from the shared flag the
+    /// render loop flips when the user presses `t`).
+    pub exchange_mode: ExchangeMode,
+    /// Whether a working Telegram channel exists (drives the `t` hint and
+    /// blocks the toggle when Telegram is not configured).
+    pub telegram_available: bool,
+    /// `Some((prompt text, input so far))` while an interactive prompt is
+    /// active; the input line is rendered at the bottom of the screen.
+    pub prompt: Option<(String, String)>,
 }
 
 /// How many log lines to keep in memory.
@@ -137,6 +184,15 @@ mod tests {
         s.set_phase(Phase::Stun, PhaseStatus::Done);
         s.set_phase(Phase::Exchange, PhaseStatus::Active);
         assert_eq!(s.active_phase(), Phase::Exchange);
+    }
+
+    #[test]
+    fn exchange_mode_round_trips_through_bits() {
+        assert_eq!(ExchangeMode::Manual.to_bits(), 0);
+        assert_eq!(ExchangeMode::Telegram.to_bits(), 1);
+        assert_eq!(ExchangeMode::from_bits(0), ExchangeMode::Manual);
+        assert_eq!(ExchangeMode::from_bits(1), ExchangeMode::Telegram);
+        assert_eq!(ExchangeMode::from_bits(99), ExchangeMode::Manual);
     }
 
     #[test]

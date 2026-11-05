@@ -395,22 +395,25 @@ wait times out.
    peer's. On success it proceeds straight to hole punching; on timeout or
    error it logs the reason and drops back to the manual prompt.
 
-### How it stays loop-safe
+### How it stays loop-safe and stale-safe
 
-Bots replying to bots can ping-pong forever. This implementation prevents
-that:
+Bots replying to bots can ping-pong forever, and `getUpdates` replays whatever
+is already queued. This implementation prevents both:
 
-- It **only ever sends once** — its own address — and never auto-replies to
-  incoming `PTUN` messages.
+- It **only ever sends its own address** and never auto-replies to incoming
+  `PTUN` messages. It re-announces each time it (re-)enters Telegram mode, so
+  a peer that started *after* the first send still sees it.
 - It **ignores its own echoes** (messages whose `from.id` is its own bot
   id), so the reply it receives isn't treated as a new peer.
 - It only accepts a `PTUN v1` payload from the **specific peer bot id**
   configured; messages from any other sender are discarded.
-- It **clears the stale backlog first.** `getUpdates` replays whatever is
-  already queued, so a `PTUN` line left over from a previous run would
-  otherwise be accepted as a (stale) peer address. On start, the client drains
-  the existing queue via the `offset` parameter and only considers messages
-  that arrive *after* it announces itself.
+- It **rejects stale announcements by message date.** A `PTUN` line left over
+  from a previous run would otherwise be accepted as a peer address whose NAT
+  mapping is long gone. The client tracks the highest `update_id` it has
+  consumed (via the `offset` parameter, so nothing is reprocessed) and only
+  accepts peer lines whose Telegram `date` is younger than 10 minutes —
+  anything older is ignored, and a *fresh* announcement from a peer that
+  started before us is still accepted.
 
 The payload format is `PTUN v1 <ip:port>`; anything not matching that prefix
 is ignored. Role negotiation (server vs client) is unchanged and still
@@ -481,7 +484,9 @@ active, · pending, ✗ error), the connection panel shows both public
 addresses, the chosen role, and the fresh cert fingerprint, and the events
 panel is a scrolling log. The header turns green on `CONNECTED` and red on
 error (which also fills the events panel). Press **`q`** or **Esc** to
-abort. It's auto-enabled only when stdout is a TTY — when piped or redirected
+abort; when a `[telegram]` table is configured, **`t`** toggles between
+Telegram and manual address exchange at any time (the status line shows the
+current mode). It's auto-enabled only when stdout is a TTY — when piped or redirected
 the original plain logging is used, and `--no-tui` forces that path while
 `--tui` forces the UI (handy for testing). When the TUI is active, `tracing`
 logging is silenced so the stderr formatter never interleaves with the
@@ -628,7 +633,7 @@ General debug moves:
 
 ```sh
 cargo build                # compile
-cargo test                 # 24 unit tests
+cargo test                 # 46 tests (42 unit + 4 integration)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo run -- --verbose     # run with debug logging
@@ -637,10 +642,13 @@ cargo run -- --verbose     # run with debug logging
 **Tests** cover STUN encode/parse (incl. edge cases: unknown attrs, wrong
 transaction IDs, v4/v6), punch timing/filtering/timeout, role symmetry
 (exhaustive over mixed v4/v6 address sets), cert/fingerprint construction,
-and the bridge's copy + half-close semantics (via in-memory `tokio::io`
-streams). By project decision there is deliberately **no loopback test of the
-QUIC server+client path** (one machine playing both roles is ambiguous); the
-real handshake is validated in two-machine tests.
+the bridge's copy + half-close semantics (via in-memory `tokio::io`
+streams), and — as integration tests — the full Telegram exchange against a
+local mock Bot API (`tests/telegram/mock_bot_api.py`, including stale-
+backlog rejection) plus TUI prompt round-trips through the event channel. By
+project decision there is deliberately **no loopback test of the QUIC
+server+client path** (one machine playing both roles is ambiguous); the real
+handshake is validated in two-machine tests.
 
 **CI** (`.github/workflows/ci.yml`) runs on every push/PR: lint (fmt + clippy
 `-D warnings`), release build + tests on a Linux/macOS/Windows matrix, and a
@@ -662,7 +670,11 @@ probe client.
 ├── config.toml                # sample configuration
 ├── PROGRESS.md                # implementation scratchpad — phase-by-phase state
 ├── README.md                  # this file
-├── tests/nat-sim/             # Phase 12 helpers: fake STUN/NAT, echo target, probe client
+├── tests/
+│   ├── telegram_exchange.rs   # integration test: full exchange vs. mock Bot API
+│   ├── tui_prompt.rs          # integration test: TUI prompt channel round-trip
+│   ├── telegram/mock_bot_api.py  # mock Telegram Bot API server for the exchange test
+│   └── nat-sim/               # Phase 12 helpers: fake STUN/NAT, echo target, probe client
 └── src/
     ├── main.rs                # the full pipeline, one reused UDP socket, error hints
     ├── config.rs              # Config::load (serde/toml)
@@ -672,8 +684,13 @@ probe client.
     ├── role.rs                # deterministic server/client decision
     ├── quic.rs                # certs, verifier, endpoint, connect/accept
     ├── tunnel.rs              # TCP↔QUIC bridges (client + server sides)
-    └── telegram.rs            # optional Telegram bot-to-bot address exchange
+    ├── telegram.rs            # optional Telegram bot-to-bot address exchange
+    ├── tui.rs                 # ratatui/crossterm render loop, inline prompt editor
+    └── tui_state.rs           # TUI state (phases, logs) shared via an event channel
 ```
+
+`tests/` is the cargo integration-test directory; `tests/nat-sim/` and
+`tests/telegram/` hold Python helpers used by the `.rs` tests there.
 
 The full development plan lives in `plan.md` (repo parent directory);
 `PROGRESS.md` tracks what is done and what the next phase needs.
