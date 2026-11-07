@@ -96,7 +96,6 @@ async fn run(cli: cli::Cli, ui: TuiHandle) -> anyhow::Result<()> {
         tui::LogLevel::Info,
         format!("loaded config: {}", cli.config.display()),
     ));
-    ui.emit(TuiEvent::Phase(Phase::Stun, PhaseStatus::Active));
 
     info!(
         config_path = %cli.config.display(),
@@ -112,28 +111,28 @@ async fn run(cli: cli::Cli, ui: TuiHandle) -> anyhow::Result<()> {
     // THE socket: bound once, reused for STUN → hole punching → QUIC.
     // (0.0.0.0:0 keeps the MVP on IPv4, which is what home NATs typically hand out.)
     let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-    let public_addr = stun::discover_public_addr(&socket, &cfg.stun_servers)
-        .instrument(tracing::info_span!("stun"))
-        .await?;
-    info!(%public_addr, "discovered public address");
-    ui.emit(TuiEvent::OwnAddr(public_addr.to_string()));
-    ui.emit(TuiEvent::Phase(Phase::Stun, PhaseStatus::Done));
 
-    // Display own public address and ask for the peer's. In TUI mode the
-    // address is shown in the connection panel, so the plain-text prompt is
-    // only printed in the non-TUI path.
-    let tui_active = !ui.is_disabled();
-    if !tui_active {
-        println!();
-        println!("Your public address is: {public_addr}");
-        println!("Give it to the other party, then enter their public address below.");
-    }
-    ui.emit(TuiEvent::Phase(Phase::Exchange, PhaseStatus::Active));
     // Address exchange: Telegram bot-to-bot (if --telegram) or the manual
     // prompt. Telegram is a *second channel*, not a replacement — on any
     // failure (bad token, bot-to-bot disabled, timeout) we fall back to the
     // prompt so the tunnel can still be established manually.
-    let peer_addr = negotiate_peer_addr(&cli, &cfg, public_addr, &ui).await?;
+    //
+    // Address exchange: Telegram bot-to-bot (if --telegram) or the manual
+    // prompt. Telegram is a *second channel*, not a replacement — on any
+    // failure (bad token, bot-to-bot disabled, timeout) we fall back to the
+    // prompt so the tunnel can still be established manually.
+    //
+    // In Telegram mode the exchange runs in two ordered steps, gated by the
+    // bots: (1) a `PTUN READY` handshake proves the peer's process is up and
+    // listening *before* either side spends time on STUN; (2) only after
+    // that handshake do both sides discover their public addresses and
+    // announce them to each other. The manual path skips (1) — the human on
+    // the other end is the liveness signal — so STUN comes first there.
+    let (public_addr, peer_addr) = if cli.telegram && cfg.telegram.is_some() {
+        resolve_addrs_telegram(&cfg, &socket, &ui).await?
+    } else {
+        resolve_addrs_manual(&cfg, &socket, &ui).await?
+    };
     info!(%peer_addr, "peer address resolved");
     ui.emit(TuiEvent::PeerAddr(peer_addr.to_string()));
     ui.emit(TuiEvent::Phase(Phase::Exchange, PhaseStatus::Done));
@@ -243,30 +242,143 @@ fn read_line(ui: &TuiHandle, prompt: &str) -> std::io::Result<tui::PromptOutcome
     ui.ask_line(prompt)
 }
 
+/// The Telegram path: (1) the `PTUN READY` handshake proves the peer is up
+/// *before* STUN, (2) STUN discovers our address, (3) we announce it and
+/// wait for the peer's. On any Telegram failure we fall back to the manual
+/// prompt (STUN is then run first, as in [`resolve_addrs_manual`]).
+async fn resolve_addrs_telegram(
+    cfg: &config::Config,
+    socket: &tokio::net::UdpSocket,
+    ui: &TuiHandle,
+) -> anyhow::Result<(SocketAddr, SocketAddr)> {
+    let tg_cfg = cfg.telegram.as_ref().expect("checked by the caller");
+    ui.emit(TuiEvent::TelegramChannel(true));
+    ui.set_exchange_mode(tui_state::ExchangeMode::Telegram);
+    ui.emit(TuiEvent::Phase(Phase::Exchange, PhaseStatus::Active));
+
+    let mut tg = match telegram::Telegram::init(tg_cfg).await {
+        Ok(t) => {
+            ui.emit(TuiEvent::Log(
+                tui::LogLevel::Info,
+                "exchanging readiness with the peer bot over Telegram…".into(),
+            ));
+            t
+        }
+        Err(e) => {
+            let msg = format!(
+                "Telegram signaling unavailable ({e:#}) — falling back to the manual address prompt."
+            );
+            eprintln!("{msg}");
+            ui.emit(TuiEvent::TelegramChannel(false));
+            ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
+            ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
+            return resolve_addrs_manual(cfg, socket, ui).await;
+        }
+    };
+
+    // (1) Readiness handshake — the peer bot must confirm it is up before
+    // either side spends time on STUN.
+    if let Err(e) = tg.handshake(tg_cfg, || ui.aborted()).await {
+        let msg = format!(
+            "Timed out / failed waiting for the peer bot's readiness confirmation ({e:#}) — switching to the manual address prompt."
+        );
+        eprintln!("{msg}");
+        ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
+        ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
+        return resolve_addrs_manual(cfg, socket, ui).await;
+    }
+    ui.emit(TuiEvent::Log(
+        tui::LogLevel::Info,
+        "peer bot confirmed it is up — discovering our address".into(),
+    ));
+
+    // (2) STUN — safe now: the peer is up and will be announcing soon.
+    ui.emit(TuiEvent::Phase(Phase::Stun, PhaseStatus::Active));
+    let public_addr = stun::discover_public_addr(socket, &cfg.stun_servers)
+        .instrument(tracing::info_span!("stun"))
+        .await?;
+    info!(%public_addr, "discovered public address");
+    ui.emit(TuiEvent::OwnAddr(public_addr.to_string()));
+    ui.emit(TuiEvent::Phase(Phase::Stun, PhaseStatus::Done));
+
+    // (3) Announce our address, wait for the peer's.
+    if let Err(e) = tg.send_own_addr(public_addr).await {
+        let msg = format!(
+            "Telegram signaling failed ({e:#}) — falling back to the manual address prompt."
+        );
+        eprintln!("{msg}");
+        ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
+        ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
+        // STUN already ran; only the address is needed from the manual path.
+        let peer_addr = manual_peer_addr(cfg, Some(public_addr), ui).await?;
+        return Ok((public_addr, peer_addr));
+    }
+
+    match tg.wait_peer_addr(tg_cfg, || ui.aborted()).await {
+        Ok(addr) => Ok((public_addr, addr)),
+        Err(telegram::TelegramError::Aborted) => Err(anyhow::anyhow!("aborted by the user")),
+        Err(e) => {
+            let msg = format!(
+                "Timed out / failed waiting for the peer bot's address ({e}) — switching to the manual address prompt."
+            );
+            eprintln!("{msg}");
+            ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
+            ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
+            let peer_addr = manual_peer_addr(cfg, Some(public_addr), ui).await?;
+            Ok((public_addr, peer_addr))
+        }
+    }
+}
+
+/// The manual path: STUN first (the human on the other end is the liveness
+/// signal — no bot handshake needed), then the address prompt.
+async fn resolve_addrs_manual(
+    cfg: &config::Config,
+    socket: &tokio::net::UdpSocket,
+    ui: &TuiHandle,
+) -> anyhow::Result<(SocketAddr, SocketAddr)> {
+    ui.emit(TuiEvent::Phase(Phase::Stun, PhaseStatus::Active));
+    let public_addr = stun::discover_public_addr(socket, &cfg.stun_servers)
+        .instrument(tracing::info_span!("stun"))
+        .await?;
+    info!(%public_addr, "discovered public address");
+    ui.emit(TuiEvent::OwnAddr(public_addr.to_string()));
+    ui.emit(TuiEvent::Phase(Phase::Stun, PhaseStatus::Done));
+
+    // Display own public address and ask for the peer's. In TUI mode the
+    // address is shown in the connection panel, so the plain-text prompt is
+    // only printed in the non-TUI path.
+    let tui_active = !ui.is_disabled();
+    if !tui_active {
+        println!();
+        println!("Your public address is: {public_addr}");
+        println!("Give it to the other party, then enter their public address below.");
+    }
+    ui.emit(TuiEvent::Phase(Phase::Exchange, PhaseStatus::Active));
+    let peer_addr = manual_peer_addr(cfg, Some(public_addr), ui).await?;
+    Ok((public_addr, peer_addr))
+}
+
 /// Resolve the peer's public address, following the *current* exchange mode.
 ///
 /// The mode is shared with the TUI: the `t` key toggles it at any time (when
 /// Telegram is available), so this function loops — waiting on Telegram in
 /// Telegram mode, showing the manual prompt in manual mode — until one of
-/// them yields an address. `--telegram` only chooses the *initial* mode; a
-/// Telegram failure (bad token, missing config, timeout) or a toggle falls
-/// through to the manual prompt so a bot misconfiguration never blocks a
-/// working tunnel. Aborts (q/Esc/Ctrl-C) stop the run.
-async fn negotiate_peer_addr(
-    cli: &cli::Cli,
+/// them yields an address. A Telegram failure or a toggle falls through to
+/// the manual prompt so a bot misconfiguration never blocks a working
+/// tunnel. Aborts (q/Esc/Ctrl-C) stop the run.
+///
+/// `own_addr` is `Some` when STUN already ran (the common case — the caller
+/// announces it over Telegram, or just shows it at the prompt) and `None` on
+/// the Telegram-first path where the `PTUN READY` handshake must complete
+/// before STUN; that variant is only entered from [`resolve_addrs_telegram`]
+/// *after* the handshake, so it always has the address by the time an
+/// announcement is needed.
+async fn manual_peer_addr(
     cfg: &config::Config,
-    own_addr: SocketAddr,
+    own_addr: Option<SocketAddr>,
     ui: &TuiHandle,
 ) -> anyhow::Result<SocketAddr> {
-    // Initial mode: `--telegram` starts in Telegram mode when a `[telegram]`
-    // table exists; the TUI `t` key can switch back and forth afterwards.
-    let telegram_available = cli.telegram && cfg.telegram.is_some();
-    ui.emit(TuiEvent::TelegramChannel(telegram_available));
-    if telegram_available {
-        ui.set_exchange_mode(tui_state::ExchangeMode::Telegram);
-    }
-
-    let tg_cfg = cfg.telegram.as_ref();
     let mut tg: Option<telegram::Telegram> = None;
     let mut read = || read_line(ui, "Enter peer's public address (ip:port): ");
 
@@ -279,9 +391,8 @@ async fn negotiate_peer_addr(
         if mode == tui_state::ExchangeMode::Telegram {
             // Lazily initialize the signaling client (getMe) on first entry.
             if tg.is_none() {
-                let Some(tg_cfg) = tg_cfg else {
-                    // Can't happen (the flag is only set when configured),
-                    // but degrade gracefully.
+                let Some(tg_cfg) = &cfg.telegram else {
+                    // No `[telegram]` table: degrade to the manual prompt.
                     ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
                     continue;
                 };
@@ -306,10 +417,20 @@ async fn negotiate_peer_addr(
                 }
             }
             let Some(tg) = tg.as_mut() else { continue };
-            let Some(tg_cfg) = tg_cfg else { continue };
+            let Some(tg_cfg) = &cfg.telegram else {
+                continue;
+            };
 
-            // Announce our address every time we (re-)enter Telegram mode, so
-            // a peer that started after our first send still sees it.
+            // We are only here after the READY handshake (or in a manual→
+            // Telegram toggle where the peer is trivially up), so an address
+            // must be available to announce.
+            let Some(own_addr) = own_addr else {
+                // Should not happen: the handshake variant is not reachable
+                // from here. Degrade to the prompt rather than panic.
+                ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
+                continue;
+            };
+
             if let Err(e) = tg.send_own_addr(own_addr).await {
                 let msg = format!(
                     "Telegram signaling failed ({e:#}) — falling back to the manual address prompt."
@@ -326,16 +447,9 @@ async fn negotiate_peer_addr(
                 Err(telegram::TelegramError::Aborted) => {
                     return Err(anyhow::anyhow!("aborted by the user"));
                 }
-                Err(telegram::TelegramError::Timeout { .. }) => {
-                    let msg = "Timed out waiting for the peer bot's address — switching to the manual address prompt (press t to try Telegram again).".to_string();
-                    eprintln!("{msg}");
-                    ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));
-                    ui.set_exchange_mode(tui_state::ExchangeMode::Manual);
-                    continue;
-                }
                 Err(e) => {
                     let msg = format!(
-                        "Telegram signaling failed ({e:#}) — switching to the manual address prompt."
+                        "Timed out / failed waiting for the peer bot's address ({e}) — switching to the manual address prompt (press t to try Telegram again)."
                     );
                     eprintln!("{msg}");
                     ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg));

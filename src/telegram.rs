@@ -17,11 +17,22 @@
 //! - `privacy` is irrelevant here: private bot-to-bot messages are delivered
 //!   to `getUpdates` as ordinary `message` updates.
 //!
-//! **Protocol.** One line of text, self-describing:
+//! **Protocol.** Two kinds of one-line text, both self-describing:
 //!
 //! ```text
-//! PTUN v1 <ip:port>
+//! PTUN READY <secret>     ; "I'm up and listening" (sent at startup, before STUN)
+//! PTUN v1 <ip:port>       ; the public address (sent only after the READY handshake)
 //! ```
+//!
+//! **Readiness handshake (the `PTUN READY` line).** Each side announces
+//! `PTUN READY <secret>` to the peer bot at startup — *before* it discovers
+//! its public address — and waits for the peer bot's `PTUN READY` line. Only
+//! once both sides know the other is up do they call STUN and announce their
+//! `PTUN v1` address. Without this gate the messages cross in flight and a
+//! side can end up punching toward the peer's *previous* run's address.
+//! The `<secret>` (a shared `[telegram].secret` value) proves the READY line
+//! is the peer's, not a stale or foreign message; the `date` staleness check
+//! guards against READY lines from earlier runs.
 //!
 //! **Stale-announcement handling.** Each side announces exactly once at the
 //! start of its exchange, so the *newest* `PTUN` line in the bot's update
@@ -51,6 +62,20 @@ use crate::config::TelegramConfig;
 
 /// Marker line format shared with the peer: `PTUN v1 <ip:port>`.
 const PAYLOAD_PREFIX: &str = "PTUN v1 ";
+
+/// Marker line for the "I'm up, come find me" readiness handshake that must
+/// complete before either side announces an address (see [`handshake`]).
+const READY_PREFIX: &str = "PTUN READY ";
+
+/// How long `handshake` waits for the peer bot's `PTUN READY` line before
+/// giving up (falling back to the manual address prompt).
+const READY_TIMEOUT_SECS: u64 = 60;
+
+/// A `PTUN READY` line older than this is ignored: it belongs to a previous
+/// run of the peer, and acting on it would let us STUN + punch toward a peer
+/// that is not actually listening. Ten minutes comfortably covers two
+/// machines being started a few minutes apart.
+const MAX_READY_AGE_SECS: i64 = 600;
 
 /// `getUpdates` long-poll window. Telegram holds the request up to 50 s; a
 /// shorter window means the exchange loop wakes more often, so user aborts
@@ -159,12 +184,10 @@ impl Telegram {
 
     /// Announce our address to the peer bot.
     ///
-    /// The protocol is simply: each side sends its own `PTUN v1 <addr>` line
-    /// to the peer bot at the start of the exchange; each side waits for the
-    /// peer's line. The messages cross in flight and both sides proceed. A
-    /// peer that already announced in a previous run needs no re-send: its
-    /// line is still in the queue and (if fresh) is accepted by
-    /// [`wait_peer_addr`](Self::wait_peer_addr).
+    /// Send this *after* [`handshake`](Self::handshake) succeeded — i.e. once
+    /// we know the peer is up. The protocol is: each side sends its own
+    /// `PTUN v1 <addr>` line to the peer bot; each side waits for the peer's
+    /// line via [`wait_peer_addr`](Self::wait_peer_addr).
     pub async fn send_own_addr(&self, own_addr: SocketAddr) -> anyhow::Result<()> {
         let text = format!("{PAYLOAD_PREFIX}{own_addr}");
         let chat_id = self.peer_bot_id.to_string();
@@ -186,6 +209,11 @@ impl Telegram {
     /// Wait for the peer's address: long-poll `getUpdates` and accept the
     /// peer bot's `PTUN` line, provided it is fresh (younger than
     /// [`MAX_ADDR_AGE_SECS`]) and not an echo of our own send.
+    ///
+    /// Call this *after* [`handshake`](Self::handshake): the READY exchange
+    /// guarantees the peer is up before either side spends time on STUN and
+    /// address announcements, so a `PTUN v1` line we receive here is from a
+    /// live peer (staleness is still enforced by `date`).
     ///
     /// Resolves with the peer's public address, [`TelegramError::Timeout`] after
     /// `cfg.timeout_secs`, or [`TelegramError::Aborted`] as soon as
@@ -257,6 +285,162 @@ impl Telegram {
                 }
             }
         }
+    }
+
+    /// Send our `PTUN READY <secret>` line to the peer bot and wait for the
+    /// peer bot's own `PTUN READY <secret>` line.
+    ///
+    /// This is the first step of the address exchange: it proves the peer's
+    /// process (and its bot) is up and *listening*, before either side calls
+    /// STUN or announces an address. Both sides run this at startup, so the
+    /// two READY messages cross in flight and each side proceeds as soon as
+    /// it has seen the other's.
+    ///
+    /// The secret must match `[telegram].secret` on both machines: a READY
+    /// line with a different (or missing) secret is ignored, and a READY line
+    /// older than [`MAX_READY_AGE_SECS`] is ignored as stale. Own-bot echoes
+    /// are ignored like everywhere else (loop prevention — we never auto-
+    /// reply to incoming bot messages).
+    ///
+    /// Resolves once the peer's READY line is seen, [`TelegramError::Timeout`]
+    /// after [`READY_TIMEOUT_SECS`], or [`TelegramError::Aborted`] as soon as
+    /// `is_aborted()` returns true (checked before and after every poll).
+    pub async fn handshake(
+        &mut self,
+        cfg: &TelegramConfig,
+        is_aborted: impl Fn() -> bool + Send,
+    ) -> anyhow::Result<()> {
+        let secret = cfg
+            .secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default()
+            .to_string();
+        anyhow::ensure!(
+            !secret.is_empty(),
+            "config: `[telegram].secret` is required for the bot-to-bot readiness handshake"
+        );
+
+        let own_id = self.own_bot_id.ok_or_else(|| {
+            TelegramError::Request("Telegram::init must be called before the handshake".into())
+        })?;
+
+        let text = format!("{READY_PREFIX}{secret}");
+        let chat_id = self.peer_bot_id.to_string();
+        let fields: [(&str, &str); 2] = [("chat_id", &chat_id), ("text", &text)];
+        self.call_with::<serde_json::Value>("sendMessage", &fields)
+            .await
+            .with_context(|| {
+                format!(
+                    "sending our PTUN READY line to peer bot {} — is Bot-to-Bot Communication \
+                     Mode enabled for BOTH bots in @BotFather? Is `[telegram].peer_bot_id` \
+                     the peer bot's numeric id?",
+                    self.peer_bot_id
+                )
+            })?;
+        info!(
+            peer_bot_id = self.peer_bot_id,
+            "sent PTUN READY; waiting for the peer bot to confirm it is up (q / Esc / Ctrl-C to cancel)"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(READY_TIMEOUT_SECS);
+        loop {
+            if is_aborted() {
+                return Err(anyhow::Error::from(TelegramError::Aborted));
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow::Error::from(TelegramError::Timeout {
+                    peer_bot_id: self.peer_bot_id,
+                    timeout_secs: READY_TIMEOUT_SECS,
+                }));
+            }
+            // Never long-poll past the overall deadline.
+            let poll = remaining.min(Duration::from_secs(GET_UPDATES_TIMEOUT_SECS));
+
+            let res = tokio::time::timeout(
+                poll + Duration::from_secs(15), // client-side guard vs. a stuck read
+                self.fetch_updates(),
+            )
+            .await;
+
+            let updates = match res {
+                Ok(Ok(updates)) => updates,
+                Ok(Err(e)) => {
+                    warn!(error = %e, "getUpdates failed during handshake; retrying");
+                    continue;
+                }
+                Err(_) => {
+                    warn!("getUpdates hung past its guard during handshake; retrying");
+                    continue;
+                }
+            };
+
+            for msg in updates {
+                // Track the highest update id we've seen so the next poll
+                // starts strictly after it — no re-delivery. (The same
+                // `Telegram` instance is reused for `wait_peer_addr`, whose
+                // offset picks up right where this loop left off.)
+                if msg.update_id + 1 > self.seen {
+                    self.seen = msg.update_id + 1;
+                }
+                if self.classify_ready(&msg, own_id, &secret) {
+                    info!("peer bot confirmed it is up — the readiness handshake is complete");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// If this message is a *fresh* `PTUN READY <secret>` line from the peer
+    /// bot (matching secret, younger than [`MAX_READY_AGE_SECS`]), return
+    /// true. Own-bot echoes, other senders, mismatched/missing secrets and
+    /// stale lines are ignored.
+    fn classify_ready(&self, msg: &UpdateMessage, own_id: i64, secret: &str) -> bool {
+        let Some(text) = msg.message.text.as_deref() else {
+            return false;
+        };
+        let Some(body) = text.trim().strip_prefix(READY_PREFIX) else {
+            return false;
+        };
+        let Some(from) = msg.message.from.as_ref() else {
+            return false;
+        };
+        if from.id == own_id || !from.is_bot {
+            return false;
+        }
+        if from.id != self.peer_bot_id {
+            warn!(
+                sender = from.id,
+                "ignoring PTUN READY message from unexpected sender"
+            );
+            return false;
+        }
+        // The secret must match exactly: this is what distinguishes "the peer
+        // is up right now" from a stray line in the chat.
+        if body.trim() != secret {
+            warn!("ignoring PTUN READY line with a mismatched secret");
+            return false;
+        }
+        // Staleness: a READY line from a previous run of the peer (before the
+        // process that is actually listening started) is not proof of
+        // readiness. A missing date (0, synthetic test messages) is accepted.
+        if msg.message.date > 0 {
+            let age = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+                - msg.message.date;
+            if age > MAX_READY_AGE_SECS {
+                warn!(
+                    age_secs = age,
+                    "ignoring stale PTUN READY line (older than {MAX_READY_AGE_SECS}s)"
+                );
+                return false;
+            }
+        }
+        true
     }
 
     /// If this message is a *fresh* `PTUN v1 <addr>` line from the peer bot,
@@ -556,5 +740,63 @@ mod tests {
             tg.classify(&m, 1001),
             Some("10.1.2.3:4321".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn ready_line_is_well_formed() {
+        let line = format!("{READY_PREFIX}my-secret");
+        assert_eq!(line, "PTUN READY my-secret");
+    }
+
+    #[test]
+    fn classify_ready_accepts_peer_line() {
+        let tg = tg_for_test(9001);
+        let m = msg(9001, true, "PTUN READY my-secret");
+        assert!(tg.classify_ready(&m, 1001, "my-secret"));
+    }
+
+    #[test]
+    fn classify_ready_ignores_own_echo() {
+        let tg = tg_for_test(9001);
+        let m = msg(1001, true, "PTUN READY my-secret");
+        assert!(!tg.classify_ready(&m, 1001, "my-secret"));
+    }
+
+    #[test]
+    fn classify_ready_ignores_unexpected_sender_and_non_bot() {
+        let tg = tg_for_test(9001);
+        assert!(!tg.classify_ready(&msg(7777, true, "PTUN READY my-secret"), 1001, "my-secret"));
+        assert!(!tg.classify_ready(&msg(9001, false, "PTUN READY my-secret"), 1001, "my-secret"));
+    }
+
+    #[test]
+    fn classify_ready_rejects_mismatched_or_missing_secret() {
+        let tg = tg_for_test(9001);
+        assert!(!tg.classify_ready(&msg(9001, true, "PTUN READY wrong"), 1001, "my-secret"));
+        assert!(!tg.classify_ready(&msg(9001, true, "PTUN READY"), 1001, "my-secret"));
+        assert!(!tg.classify_ready(&msg(9001, true, "PTUN v1 1.2.3.4:5"), 1001, "my-secret"));
+        assert!(!tg.classify_ready(&msg(9001, true, "hello"), 1001, "my-secret"));
+    }
+
+    #[test]
+    fn classify_ready_rejects_stale_line() {
+        let tg = tg_for_test(9001);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let m = msg_at(9001, true, "PTUN READY my-secret", now - 3600);
+        assert!(!tg.classify_ready(&m, 1001, "my-secret"));
+    }
+
+    #[test]
+    fn classify_ready_accepts_fresh_line() {
+        let tg = tg_for_test(9001);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let m = msg_at(9001, true, "PTUN READY my-secret", now - 5);
+        assert!(tg.classify_ready(&m, 1001, "my-secret"));
     }
 }

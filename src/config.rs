@@ -45,6 +45,12 @@ pub struct TelegramConfig {
     /// back to the manual "type the address" prompt.
     #[serde(default = "default_telegram_timeout_secs")]
     pub timeout_secs: u64,
+    /// A small shared secret both operators must paste into their configs.
+    /// It travels in the `PTUN READY` line the bots exchange *before* STUN,
+    /// which proves the other bot is up and listening (see
+    /// `telegram::Telegram::handshake`). Required for the `--telegram` path.
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 fn default_telegram_timeout_secs() -> u64 {

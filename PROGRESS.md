@@ -48,6 +48,48 @@ profile — no new native toolchain requirements.
 
 ### Phase 3 — Telegram signaling (2026-07-12) ✅
 
+### Phase 12 — Telegram-first ordering: `PTUN READY` handshake before STUN (2026-07-12) ✅
+The exchange used to be STUN → announce, so the two bots' address messages
+crossed in flight and a side could punch toward the peer's *previous* run's
+address. Now the Telegram path is ordered: (1) each side sends the peer bot a
+`PTUN READY <secret>` line at startup and waits for the peer bot's matching
+READY line — proving the peer's process is up *before* either side calls
+STUN; (2) only after the handshake do both sides discover their public
+addresses; (3) each side announces its `PTUN v1` address over Telegram and
+waits for the peer's.
+- **`src/telegram.rs`**: `Telegram::handshake(&TelegramConfig, is_aborted)`
+  (send READY, long-poll for the peer's READY with the same 60 s deadline /
+  abort semantics as the address wait) and `classify_ready` (peer-bot sender
+  + exact `[telegram].secret` match + ≤ 10 min staleness; own-bot echoes and
+  unexpected senders ignored, like everywhere else). The existing
+  `update_id`-based offset means `wait_peer_addr` reuses the same instance
+  right where the handshake left off — no re-delivery. New unit tests cover
+  the READY classifier (own-echo / wrong-sender / wrong-secret / stale /
+  fresh lines). Module docs now describe the two-line protocol.
+- **`src/config.rs`**: `TelegramConfig.secret: Option<String>` (new `[telegram]`
+  key; required for the Telegram path, enforced in `handshake` — a clear error
+  tells the operator to add it to both configs).
+- **`src/main.rs`**: the pipeline's exchange block is now `resolve_addrs_telegram`
+  (handshake → STUN → announce → wait) vs `resolve_addrs_manual` (STUN →
+  prompt) — the manual path keeps STUN-first, since the human on the other
+  end is the liveness signal there. `manual_peer_addr` is the mode-toggle loop
+  (Telegram wait ↔ prompt) shared by both. Every Telegram failure (init,
+  handshake timeout, send, wait) falls back to the manual prompt as before —
+  a bot misconfiguration never blocks a working tunnel.
+- **TUI**: the phase stepper is unchanged (STUN → Exchange → …) but on the
+  Telegram path the *Exchange* phase is Active first (the handshake) and
+  STUN runs in between; events are emitted for the handshake outcome so the
+  log explains the ordering.
+- **Verified:** `cargo build` clean, `cargo clippy --all-targets` clean, `cargo
+  fmt --check` clean, 52/52 tests pass (49 lib incl. 7 new READY tests + 3
+  nat-sim + 1 `telegram_exchange` mock-bot integration test, which now passes
+  `secret` through).
+- **Operator note:** both `config.toml`s need the same non-empty
+  `[telegram].secret` value (any shared string — it travels over Telegram,
+  which is TLS, and just distinguishes the peer's READY line from a stray
+  one). Existing setups without it get a clear error and fall back to the
+  prompt until it's added.
+
 ### Phase 0 — Project Skeleton ✅
 - Modules: main, config, stun, punch, role, quic, tunnel, cli.
 - Deps: tokio(full), clap(derive), serde(derive), toml, tracing, tracing-subscriber(env-filter),

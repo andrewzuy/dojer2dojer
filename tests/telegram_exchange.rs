@@ -57,6 +57,7 @@ async fn telegram_exchange_against_mock_bot_api() {
         token: "test:token".into(),
         peer_bot_id: 9001,
         timeout_secs: 15,
+        secret: Some("test-secret".into()),
     };
     let mut tg = Telegram::init(&cfg).await.expect("build client");
 
