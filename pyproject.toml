@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "p2p-tunnel"
+version = "0.1.0"
+description = "P2P NAT-traversal tunnel: two machines behind NATs reach each other's private TCP services over a QUIC byte pipe. Python port of the Rust implementation."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "p2p-tunnel contributors" }]
+keywords = ["p2p", "nat", "hole-punching", "stun", "quic", "tunnel"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Internet :: Proxy Servers",
+  "Topic :: System :: Networking",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+]
+# Exactly ONE direct third-party dependency. aioquic (pure Python, BSD-3)
+# provides QUIC + TLS 1.3 and pulls `cryptography` (C extension), `h11` and
+# `pyrfc3339` transitively. Everything else is the Python standard library.
+dependencies = [
+  "aioquic>=1.7,<2",
+]
+
+[project.scripts]
+p2p-tunnel = "p2p_tunnel.main:main"
+
+[tool.setuptools]
+packages = ["p2p_tunnel"]
+
+[tool.setuptools.package-data]
+p2p_tunnel = ["py.typed"]

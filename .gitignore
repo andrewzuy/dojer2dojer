@@ -1,1 +1,12 @@
+# Rust artifacts (this branch is the Python port; they live on `main`)
 /target
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/

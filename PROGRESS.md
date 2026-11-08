@@ -1,314 +1,77 @@
-# PROGRESS — implementation scratchpad (context handoff doc)
+# PROGRESS — Python port development log
 
-Project: `p2p-tunnel/` (Rust, edition 2024, cargo 1.93)
-Plan: `../plan.md`. After each phase: verify (`cargo build` + `cargo test` + `cargo clippy`),
-then update this file. Implement phases self-contained from plan.md + this file + code on disk.
+This is the development log for the Python rewrite (branch `python`).
+The Rust implementation on `main` is frozen and serves as the reference
+(oracle) — see `PLAN.md` for the full plan. Each entry is appended in
+chronological order; latest last.
 
-## Done
+---
 
-### Phase 3 — Live TUI (2026-11-01) ✅
-A full-screen live UI (ratatui 0.30 + crossterm 0.29, cross-platform, no native
-deps) that visualizes the whole tunnel lifecycle. Pure-async pipeline is
-unchanged — it now emits `TuiEvent`s through a `TuiHandle` (an `mpsc` sender,
-`Clone`); a dedicated **render thread** owns the terminal and folds events into
-`TuiState`, drawing on each tick.
+## 2026-07-21 — Phase 0: branch, scaffold, plan
 
-- **`src/tui_state.rs`** (new): `Phase` (Stun/Exchange/Punch/Role/Quic/Tunnel),
-  `PhaseStatus` (Pending/Active/Done/Error), `TuiState` (addresses, role,
-  fingerprint, port, target, bounded log, ready/done/error flags). `set_phase`
-  auto-completes any earlier still-Active phase so the stepper never shows two
-  actives. Unit-tested (phase transitions, frontier, log bounding).
-- **`src/tui.rs`** (new): `TuiEvent` enum + `apply_event` (pure fold),
-  `TuiHandle` (sender, or disabled no-op), `run_render_loop` (raw mode +
-  alternate screen, 60 ms poll, `q`/Esc to quit), and the draw functions:
-  header (title + status pill: idle/working/CONNECTED/ERROR), a phase stepper
-  (✓ / animated braille spinner / · / ✗, color-coded), a connection diagram
-  (own/peer addr, role, cert fingerprint), and a scrolling event log (tail-
-  pinned). State shared via a `LazyLock<Mutex<TuiState>>`.
-- **`src/main.rs`**: TUI auto-enabled when `std::io::stdout().is_tty()`
-  (crossterm `IsTty`), overridable with `--tui` / `--no-tui`. When active,
-  `tracing` is set to `off` (TUI is the single source of truth; avoids
-  stderr/alternate-screen interleaving) and the raw `error:`/`hint` block is
-  suppressed (the TUI paints it red; still exits 1). Pipeline emits events at
-  every stage (STUN done, exchange, punch, role, cert fingerprint, ready, done,
-  errors) via `handle.clone()` into `run()`. Error path sleeps ~3 s so the
-  render loop can paint before exit.
-- **`src/cli.rs`**: `--tui`, `--no-tui` flags.
-- **Verified:** `cargo test` = 39 passing (36 prior + 3 new `tui_state`),
-  `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean.
-  Smoke-tested the TUI under a PTY (`script -qec`): header/lifecycle/connection/
-  events panels render, spinner animates, error turns header red and fills the
-  events panel, terminal restored on exit. Non-TTY (piped) and `--no-tui` paths
-  produce the original plain logging + `error:` + `hint:` unchanged (no
-  regression). `--help` lists the new flags.
+**What happened**
 
-**Note for CI / musl:** ratatui + crossterm are pure Rust (crossterm uses
-`rustix`/`libc` on unix, `winapi` on Windows) and build fine in the musl static
-profile — no new native toolchain requirements.
+- Created branch `python` from `main` (tip `f2dc2a4`, Rust `v0.1.0`).
+- Removed the Rust-only files from this branch: `src/`, `Cargo.toml`,
+  `Cargo.lock`, `.github/` (Rust CI). Kept: `config.toml` (format
+  unchanged — the Python port reads the same file), `LICENSE`, and the
+  already-Python test helpers `tests/nat-sim/*.py` and
+  `tests/telegram/mock_bot_api.py` (reused as-is).
+- Wrote `PLAN.md`: full port plan — goals, the verified `aioquic` API
+  spike, architecture, wire/behavior parity contract, 17 phases
+  (0–16) with per-phase tests mapped 1:1 to the 46 Rust tests, test
+  strategy, risks.
+- Scaffold:
+  - `pyproject.toml` — setuptools, `requires-python >=3.11`, **one**
+    direct dependency (`aioquic>=1.7,<2`), console script `p2p-tunnel`.
+  - `p2p_tunnel/` package: `__init__.py` (version 0.1.0), `__main__.py`,
+    stub `main.py` (`--help`/`-V` only; pipeline lands in Phases 1–13).
+  - `README.md` replaced with a short stub pointing at `PLAN.md`
+    (full manual rewritten in Phase 16).
+  - `.gitignore`: added `.venv/`, `__pycache__/`, `*.pyc`, `build/`,
+    `dist/`, `*.egg-info/`.
+- `PROGRESS.md` (this file) replaced the Rust scratchpad — the Rust
+  development history remains available on `main`.
 
-### Phase 3 — Telegram signaling (2026-07-12) ✅
+**Dependency decision (the big one)**
 
-### Phase 12 — Telegram-first ordering: `PTUN READY` handshake before STUN (2026-07-12) ✅
-The exchange used to be STUN → announce, so the two bots' address messages
-crossed in flight and a side could punch toward the peer's *previous* run's
-address. Now the Telegram path is ordered: (1) each side sends the peer bot a
-`PTUN READY <secret>` line at startup and waits for the peer bot's matching
-READY line — proving the peer's process is up *before* either side calls
-STUN; (2) only after the handshake do both sides discover their public
-addresses; (3) each side announces its `PTUN v1` address over Telegram and
-waits for the peer's.
-- **`src/telegram.rs`**: `Telegram::handshake(&TelegramConfig, is_aborted)`
-  (send READY, long-poll for the peer's READY with the same 60 s deadline /
-  abort semantics as the address wait) and `classify_ready` (peer-bot sender
-  + exact `[telegram].secret` match + ≤ 10 min staleness; own-bot echoes and
-  unexpected senders ignored, like everywhere else). The existing
-  `update_id`-based offset means `wait_peer_addr` reuses the same instance
-  right where the handshake left off — no re-delivery. New unit tests cover
-  the READY classifier (own-echo / wrong-sender / wrong-secret / stale /
-  fresh lines). Module docs now describe the two-line protocol.
-- **`src/config.rs`**: `TelegramConfig.secret: Option<String>` (new `[telegram]`
-  key; required for the Telegram path, enforced in `handshake` — a clear error
-  tells the operator to add it to both configs).
-- **`src/main.rs`**: the pipeline's exchange block is now `resolve_addrs_telegram`
-  (handshake → STUN → announce → wait) vs `resolve_addrs_manual` (STUN →
-  prompt) — the manual path keeps STUN-first, since the human on the other
-  end is the liveness signal there. `manual_peer_addr` is the mode-toggle loop
-  (Telegram wait ↔ prompt) shared by both. Every Telegram failure (init,
-  handshake timeout, send, wait) falls back to the manual prompt as before —
-  a bot misconfiguration never blocks a working tunnel.
-- **TUI**: the phase stepper is unchanged (STUN → Exchange → …) but on the
-  Telegram path the *Exchange* phase is Active first (the handshake) and
-  STUN runs in between; events are emitted for the handshake outcome so the
-  log explains the ordering.
-- **Verified:** `cargo build` clean, `cargo clippy --all-targets` clean, `cargo
-  fmt --check` clean, 52/52 tests pass (49 lib incl. 7 new READY tests + 3
-  nat-sim + 1 `telegram_exchange` mock-bot integration test, which now passes
-  `secret` through).
-- **Operator note:** both `config.toml`s need the same non-empty
-  `[telegram].secret` value (any shared string — it travels over Telegram,
-  which is TLS, and just distinguishes the peer's READY line from a stray
-  one). Existing setups without it get a clear error and fall back to the
-  prompt until it's added.
+- Exactly one direct third-party dependency: **aioquic 1.7.2**
+  (pure-Python QUIC + TLS 1.3, BSD-3). Verified it installs cleanly on
+  Python 3.14 and, crucially, that its asyncio layer can be driven on
+  **our** pre-bound UDP socket — on both the client side
+  (`loop.create_datagram_endpoint(..., sock=our_sock)` +
+  `QuicConnectionProtocol`) and the server side (`QuicServer` is a plain
+  `asyncio.DatagramProtocol`; instantiate directly and attach our
+  socket). This preserves the Rust design where the single UDP socket
+  carries STUN → hole punching → QUIC.
+- Consequence: STUN, hole punching, role, config, CLI, Telegram, TUI,
+  and tests are all standard library. The TUI uses `curses` (no
+  `ratatui` equivalent in stdlib — `curses` is stdlib on Linux/macOS;
+  auto-disabled on Windows).
+- Deviation noted in the plan: the Python port **adds** loopback QUIC
+  e2e tests (the Rust project skipped them due to quinn socket-ownership
+  ambiguity; aioquic makes them deterministic and cheap).
 
-### Phase 0 — Project Skeleton ✅
-- Modules: main, config, stun, punch, role, quic, tunnel, cli.
-- Deps: tokio(full), clap(derive), serde(derive), toml, tracing, tracing-subscriber(env-filter),
-  anyhow, thiserror, rand 0.9.
-- Added in Phase 6/7: quinn 0.11, rcgen 0.13, sha2 0.10, hex 0.4 (quinn re-exports rustls).
-- main: `#[tokio::main]`, tracing with RUST_LOG (default `info`).
-- main owns THE socket: `UdpSocket::bind("0.0.0.0:0")` (v4 MVP) — reused STUN → punch → QUIC.
+**Verified (spike results, all reproducible)**
 
-### Phase 1 — Configuration System ✅
-- `config::Config` (serde): `stun_servers: Vec<String>`, `punch_interval_ms: u64` (def 500),
-  `punch_timeout_secs: u64` (def 30), `local_tcp_listen_port: Option<u16>`, `remote_target_addr: Option<String>`.
-- `Config::load(&Path) -> anyhow::Result<Config>`; bails if stun_servers empty.
-- `cli::Cli` (clap derive): `--config` default `./config.toml`. `Cli::parse()` is the clap TRAIT
-  method — `use clap::Parser;` needed at call site.
-- `cli::parse_peer_addr(&str) -> Result<SocketAddr, String>`.
-- Sample `config.toml` in project root.
+- `aioquic 1.7.2` + `cryptography 50.0.2` in a fresh venv on Python 3.14.8.
+- `QuicConfiguration` fields: `verify_mode` (client accept-any =
+  `ssl.CERT_NONE`; 1.7.2 has no `is_trusted`), `idle_timeout` (default
+  60 s), `server_name`, `certificate`/`private_key` accept
+  `cryptography` objects directly.
+- `QuicConnectionProtocol.create_stream(False)` returns real
+  `asyncio.StreamReader`/`StreamWriter`; `write_eof()` sends the QUIC
+  FIN → half-close native → the TCP↔QUIC bridge is the same copy-both-ways
+  shape as Rust.
+- `QuicServer(configuration=..., stream_handler=...)` receives incoming
+  streams via the callback — the server-side bridge hook.
+- `protocol.ping()` awaits a PING ack — used by the keep-alive task
+  (every `keep_alive_interval_secs`, both roles, cancellable).
+- Peer cert reachable post-handshake at
+  `protocol.connection.tls._peer_certificate` (private attr; used
+  defensively for the extra fingerprint log line).
 
-### Phase 2 — STUN Client ✅ (manual, RFC 5389)
-- `stun::StunError` (thiserror): Rejected / Malformed / Io.
-- `encode_binding_request(&[u8;12]) -> [u8;20]`; `parse_binding_response(&[u8], &txn) -> Result<SocketAddr, StunError>`
-  (type/magic/txn checks, attr walk w/ 4-byte padding, XOR-MAPPED + MAPPED, v4+v6).
-- `discover_public_addr(&UdpSocket, &[String]) -> anyhow::Result<SocketAddr>`:
-  `tokio::net::lookup_host` for hostnames (config servers ARE hostnames), 2 rounds, 3s/attempt timeout.
-- Verified LIVE: STUN IP == ipify == ifconfig.me (178.125.248.230).
+**Next (Phase 1)**
 
-### Phase 3 — Display Address + Manual Peer Input ✅
-- `cli::prompt_peer_addr() -> anyhow::Result<SocketAddr>`: loop, stdout prompt (flush), stdin read_line,
-  empty → re-prompt, invalid → eprintln reason + re-prompt. Blocking stdin in async main: OK (one-shot, documented).
-- main: prints "Your public address is: X" + instructions, prompts peer.
-- Verified: piped `not-an-addr\n\n1.2.3.4:9999` → 2 re-prompts then accepted.
-
-### Phase 4 — UDP Hole Punching ✅
-- `punch::punch(&UdpSocket, peer: SocketAddr, &Config) -> anyhow::Result<()>`:
-  8-byte random nonce, single-task `tokio::select!` over {interval tick (first completes immediately → instant first punch),
-  recv_from (accept only from==peer, ignore others w/ debug log), sleep_until(deadline)}.
-  Bails with count of sent packets on timeout.
-- 3 loopback tests: success-after-delay, ignores-stranger-sender, timeout. 14 tests total.
-- Real-NAT verification deferred to Phase 12.
-
-### Phase 5 — Role Negotiation ✅
-- `role::Role { Server, Client }` + `as_str()`.
-- `role::determine_role(own, peer) -> Role`: total order via `ip_key` —
-  `(family, [u8;16])`, family 4 < 6, v4 right-padded; lower IP → Server, higher → Client.
-  Same-IP tie (local testing only) falls back to port.
-- 5 unit tests: both v4 orderings, exhaustively opposite roles over a mixed v4/v6 set,
-  v4-beats-v6, v6 numerical order, same-IP port fallback.
-- main: logs `role = server|client` after punch.
-
-### Phase 6 — Self-Signed Certificates ✅
-- Deps added: quinn 0.11, rcgen 0.13, sha2 0.10, hex 0.4. quinn re-exports rustls —
-  no direct rustls dep needed (`quinn::rustls::...` paths).
-- `quic::CERT_CN = "p2p-tunnel"`; `quic::generate_self_signed_cert()` →
-  `(Vec<CertificateDer>, PrivateKeyDer<Pkcs8>)`, fresh ECDSA P-256 per session.
-- `quic::fingerprint(&CertificateDer) -> String`: SHA-256 hex; logged on both sides
-  for out-of-band comparison (MVP trust model — see README §Security).
-- `AcceptAnyServerCert` (custom `ServerCertVerifier`): no chain/hostname verification,
-  but TLS 1.2/1.3 handshake signatures ARE verified for real via the ring provider.
-  `build_client_config()` uses it; `build_server_config(certs, key)` presents our cert.
-
-### Phase 7 — QUIC Endpoint on the Punched Socket ✅
-- `quic::create_endpoint(std::net::UdpSocket, Option<ServerConfig>)` —
-  `quinn::Endpoint::new` + `quinn::default_runtime()`; takes ownership of the socket
-  (our tokio socket via `.into_std()` after punch; quinn runs its own I/O driver).
-- `quic::connect(&Endpoint, peer_addr)` (client, SNI = CERT_CN) and
-  `quic::accept(&Endpoint)` (server) — both log on success.
-- main.rs now: config → socket → STUN → print addr → prompt peer → punch → role →
-  cert → QUIC endpoint (+server config if Server role, +default client config if Client).
-  Binary stops here — handshake + stream bridges are wired in Phases 8–10.
-- **Decision (2026-10-25):** no loopback test with QUIC server + client on
-  localhost (conflicts/ambiguity on one machine); the real handshake is verified
-  in Phase 12 between two real machines on different networks.
-
-### Phase 8 — Client Bridge (TCP→QUIC) ✅
-- `tunnel::run_client_side(conn: quinn::Connection, listen_port: u16)`:
-  binds `127.0.0.1:<port>` (loopback only); per accepted TCP conn → spawn a
-  bridge task on a fresh `conn.open_bi()` stream; exits when the QUIC
-  connection closes (`conn.closed()`).
-- `tunnel::bridge_stream(conn, tcp)`: `open_bi()` + `tcp.into_split()` +
-  `bridge_halves(tcp_read, send, recv, tcp_write)` → `(bytes_up, bytes_down)`.
-- `tunnel::bridge_halves(read_a, write_a, read_b, write_b)` — the reusable copy
-  core: two spawned tasks, each `tokio::io::copy` until EOF then `shutdown()`
-  of its write half; resolves only when BOTH directions are done.
-  **Half-close propagates** (EOF on one side does not kill the other direction —
-  e.g. app finishes write side, remote replies keep flowing).
-  Generic over `AsyncRead/AsyncWrite + Unpin + Send`, so it is unit-tested with
-  in-memory `tokio::io::duplex` pairs — no loopback QUIC (per the decision above).
-- 2 new tests: both-ways byte flow with exact counts; half-close propagation
-  while the other direction keeps flowing. 24 tests total.
-- Note: tokio 1.54 `TcpStream::into_split` is SYNC (returns owned halves, not a
-  future) and `SendStream::finish(&mut self)` / `AsyncWrite::shutdown` send the QUIC FIN.
-- main.rs untouched — wiring is Phase 10 (hence the expected dead_code warnings at the time).
-
-### Phase 9 — Server Bridge (QUIC→TCP) ✅
-- `tunnel::run_server_side(conn: quinn::Connection, target_addr: SocketAddr)`:
-  loop on `tokio::select!` over `conn.accept_bi()` / `conn.closed()`; each
-  accepted stream spawns its own task → `TcpStream::connect(target_addr)` →
-  `bridge_quic_tcp(send, recv, tcp)`. Concurrent tunneled sessions are
-  independent tasks (N streams ↔ N TCP conns).
-- `tunnel::bridge_quic_tcp(send, recv, tcp)`: the shared byte-bridge core
-  (refactored out of Phase 8's `bridge_stream`): `tcp.into_split()` +
-  `bridge_halves(tcp_read, send, recv, tcp_write)` → `(bytes_up, bytes_down)`.
-- Unreachable target: warn + `send.finish()` (FIN) so the client sees EOF
-  instead of hanging.
-- Quinn 0.11 notes: `Connection::accept_bi()` returns
-  `Result<(SendStream, RecvStream), ConnectionError>` (NO Option wrapper);
-  `SendStream::finish(&mut self)` is SYNC (`Result<(), ClosedStream>`).
-
-### Phase 10 — Full main wiring ✅
-- `main.rs` after endpoint creation: `Role::Server` → parse
-  `cfg.remote_target_addr` (clear error when missing/invalid) →
-  `quic::accept` → `run_server_side`. `Role::Client` →
-  `cfg.local_tcp_listen_port` (clear error when missing) → `quic::connect` →
-  `run_client_side`. Binary now runs the complete end-to-end tunnel.
-
-### Phase 11 — Logging + diagnostics polish ✅
-- `--verbose` CLI flag (debug logging; RUST_LOG still wins if set).
-- Structured `main()` (logging init + error rendering) / `run()` (flow) split.
-- tracing spans: `stun`, `punch`, `quic_handshake`, `tunnel{role}`.
-- `hint_for(&Error)`: actionable hint for common failure modes —
-  "STUN discovery failed" (connectivity / CGNAT), "hole punching timed out"
-  (stale address / symmetric NAT), "QUIC handshake" (middlebox / peer exit),
-  "is required for the" (missing config option).
-- Failures print `error: {e:#}` (+hint) to stderr and `process::exit(1)`.
-
-### CI — cross-platform GitHub Actions ✅
-- `.github/workflows/ci.yml` (on push/PR to main + manual dispatch), 3 jobs:
-  - `lint` (ubuntu): `cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings`.
-    (Codebase ran through `cargo fmt` for the first time to make the fmt gate green.)
-  - `build-and-test`: matrix ubuntu-latest / macos-latest / windows-latest,
-    `fail-fast: false`; `cargo build --release` + `cargo test` per OS.
-  - `linux-static`: `x86_64-unknown-linux-musl` release build
-    (needs `musl-tools musl-dev`), uploaded as artifact
-    `p2p-tunnel-x86_64-linux-musl` — fully static, portable Linux binary.
-- Actions: `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`,
-  `actions/checkout@v4`, `actions/upload-artifact@v4`.
-- Local parity check before commit: fmt clean, clippy -D warnings clean,
-  24/24 tests pass.
-
-### Release workflow — prebuilt binaries ✅
-- `.github/workflows/release.yml`, triggered by a `v*` tag push, or on demand
-  (*Actions → Run workflow*, enter the tag name).
-- `build` job, matrix of 5 targets (one job each, `fail-fast: false`):
-  - Linux x86_64 `x86_64-unknown-linux-musl` (static; `musl-tools musl-dev`)
-  - Linux ARM64 `aarch64-unknown-linux-musl` (static, cross-compiled from
-    ubuntu; `ring`'s C build via apt's `gcc-aarch64-linux-gnu`, wired in with
-    `CC_aarch64_unknown_linux_musl` + `-C linker=aarch64-linux-gnu-gcc`)
-  - macOS `aarch64-apple-darwin` (native on the arm64 runner)
-  - macOS `x86_64-apple-darwin` (cross — same toolchain, no extra setup)
-  - Windows `x86_64-pc-windows-msvc` (native)
-- `publish` job gathers the artifacts, writes `SHA256SUMS`, uploads everything
-  to the GitHub Release via `softprops/action-gh-release@v2`
-  (`generate_release_notes`, `fail_on_unmatched_files`).
-- Binary names: `p2p-tunnel-<tag>-<target-triple>` (`.exe` on Windows).
-
-### Windows bug found by CI, fixed ✅
-- First CI runs failed `build + test — windows-latest`: ICMP "port
-  unreachable" replies to outbound UDP punch packets surface as `recv_from`
-  *errors* on Windows (Linux drops them silently), and `punch()` bailed on the
-  first one instead of continuing until timeout.
-- Fix in `src/punch.rs`: recv errors during punching are now logged at debug
-  and ignored (keep punching until timeout). `punch_times_out_without_peer`
-  doubles as the cross-platform regression test; the `cargo test` step was
-  restored in `ci.yml` (it had been skipped on all OSes as a workaround).
-
-### Idle-tunnel drop fixed: QUIC keep-alive PINGs ✅
-- Symptom: after the tunnel sat idle (no traffic), the connection was
-  dropped. QUIC itself is fine (its 30 s idle timeout is generous), but the
-  NATs on both sides drop the port *mapping* of a silent connection after
-  their own idle timeout, so the next packet has nowhere to go.
-- Fix: enable QUIC keep-alive. The endpoint now sends a small PING frame
-  every `keep_alive_interval_secs` (default **5 s**, new config key, `0` =
-  off) once the connection is established. Implemented in `src/quic.rs`
-  (`transport_config_with_keep_alive`, wired into `build_client_config` /
-  `build_server_config`) and driven from `src/main.rs` + `src/config.rs`.
-  Enabled on **both** roles so the tunnel survives regardless of which side
-  the NAT is stricter on. `keep_alive_interval` must stay below the QUIC
-  idle timeout of both peers (default 30 s) — 5 s is well under.
-
-## Current API surface
-- `config::Config{...}`, `Config::load(&Path)`
-- `cli::Cli{config, verbose}`, `Cli::parse()`, `cli::prompt_peer_addr()`, `cli::parse_peer_addr(&str)`
-- `stun::{encode_binding_request, parse_binding_response, discover_public_addr, StunError, STUN_MAGIC_COOKIE}`
-- `punch::punch(&UdpSocket, SocketAddr, &Config)`
-- `role::{Role, determine_role}`
-- `quic::{CERT_CN, generate_self_signed_cert, fingerprint, build_client_config, build_server_config,
-  transport_config_with_keep_alive, create_endpoint, connect, accept}`
-- `tunnel::{run_client_side, run_server_side, bridge_halves}` — all phases 8–10 wired in main.
-
-## Next: Phase 12 — real two-machine NAT test (first real QUIC handshake validation)
-1. Machine A (e.g. this box): server config (`remote_target_addr` = a private
-   service, e.g. `127.0.0.1:2222` running a local `ssh -p 2222` listener or a
-   test TCP echo server).
-2. Machine B: client config (`local_tcp_listen_port`), then
-   `ssh -p <port> user@127.0.0.1` from B should land on A's target.
-3. Verify: STUN addrs exchanged → punch success on both sides → QUIC handshake
-   (compare cert fingerprints) → bytes flow both ways → clean shutdown.
-4. Local simulation option (no second machine): two network namespaces +
-   `iptables` MASQUERADE to fake a NAT — available tools on this box:
-   `sudo`, `ip`, `iptables`, `nft`, `python3` (uid 1000, in `wheel`).
-   **Prep (uncommitted, in `tests/nat-sim/`):** three Python helpers written —
-   `stun_server.py` (fake STUN in the "box" netns that returns fake public
-   addrs AND programs the DNAT rule live, i.e. the NAT port mapping),
-   `echo_target.py` (natA target: banner + echo), `probe_client.py` (natB
-   client: send `hello\n`, expect `PONG: hello\n`, verify clean EOF).
-   Remaining: the driver (netns + MASQUERADE setup, run both tunnel
-   instances, tear down) and the actual run + `TESTING.md`.
-
-## Standing decisions
-- Errors: `anyhow` at boundaries, `thiserror` for module-level errors (StunError).
-- THE socket: tokio `UdpSocket` bound in main; passed `&UdpSocket` to STUN/punch; later converted via
-  `.into_std()` and handed to quinn (quinn owns it from then on). NOTE: dropping a quinn
-  `Endpoint` closes all its connections — keep endpoints alive for the session lifetime.
-- User-facing text: `println!` (stdout); diagnostics: `tracing`.
-- No loopback (same-machine) tests for the QUIC server+client path; real handshake
-  validated in Phase 12 on two real machines. Loopback is fine for non-QUIC units
-  (STUN parse, punch logic). Bridge logic is tested via in-memory duplex streams
-  instead (`tunnel::bridge_halves` is generic on purpose).
-- Tunnel half-close semantics: EOF in one direction shuts down only that
-  direction's write side; the other direction keeps flowing until its own EOF.
-  (Two independent copy tasks, not a `select!` that kills both on first EOF —
-  first-EOF-would-kill would break e.g. `echo x | ssh host cat`.)
-- Phase 10 flow: config → STUN → print addr → prompt peer → punch → role → certs → QUIC → tunnel.
+- `config.py` (tomllib load + defaults + validation) and `cli.py`
+  (argparse, `parse_peer_addr`, prompt loop) with their 6 ported tests.
