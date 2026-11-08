@@ -553,6 +553,6 @@ happens on this branch; the Rust code stays untouched on `main`.
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e .
 python -m compileall -q p2p_tunnel tests
-python -m unittest discover -v
+python -m unittest discover -s tests -v
 p2p-tunnel --help && p2p-tunnel -V
 ```

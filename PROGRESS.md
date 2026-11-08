@@ -75,3 +75,57 @@ chronological order; latest last.
 
 - `config.py` (tomllib load + defaults + validation) and `cli.py`
   (argparse, `parse_peer_addr`, prompt loop) with their 6 ported tests.
+
+---
+
+## 2026-07-21 — Phase 1: config + CLI parsing
+
+**What happened**
+
+- `p2p_tunnel/config.py` — direct port of Rust `src/config.rs`:
+  dataclasses `Config` + `TelegramConfig`, `tomllib` load, same defaults
+  (500 ms / 30 s / 5 s / 120 s), same validation (missing/empty
+  `stun_servers` → `config:` error; malformed TOML → `parsing config file`
+  error; read failure → `reading config file` error; wrong types rejected;
+  unknown keys ignored). Error strings keep the Rust wording because
+  `hint_for()` matches on substrings.
+- `p2p_tunnel/cli.py` — direct port of Rust `src/cli.rs`:
+  - `Cli.parse(argv)` via argparse: `--config` (default `./config.toml`),
+    `--verbose`, `--telegram`, `--tui`, `--no-tui`, `-V/--version`.
+  - `parse_peer_addr(s) -> (host, port)` mirroring Rust's
+    `SocketAddr::from_str`: IPv4 + IPv6 `[v6]:port` literals, port required
+    and in 1..65535.
+  - `prompt_peer_addr(read)` — the re-prompting loop, decoupled from the
+    input transport via an injected `read()` callable returning a
+    `PromptOutcome` (line / mode-toggled / aborted / eof); OSError from
+    `read` maps to `Aborted` (Rust parity). Bail reasons are exception
+    classes (`ModeToggled` / `Aborted` / `Eof`, all `PromptBail`) instead
+    of an `Err` enum — Pythonic, same contract.
+  - `read_line_stdin(prompt)` — the plain-stdin transport used when the
+    TUI is off; the TUI will supply its own transport in Phase 13.
+- `main.py` now parses the real `Cli` (pipeline body still a stub).
+
+**Tests** — `tests/test_config.py` (12) + `tests/test_cli.py` (14) = 26 total,
+all green. Ports the 6 Rust tests (`loads_full_config`,
+`loads_telegram_section`, `telegram_timeout_override`,
+`explicit_overrides_win`, `parses_valid_addrs`, `rejects_invalid_addrs`) and
+adds: `PTUN READY` secret loading, missing/empty `stun_servers` errors,
+malformed TOML, nonexistent file, bad port type, unknown-keys-ignored,
+CLI flag parsing, and the full prompt-loop contract (empty/invalid
+re-prompt with exact stderr messages, toggle/abort/EOF bails, OSError→abort).
+
+**Notes**
+
+- `unittest discover` needs `-s tests` (tests are not a package on purpose —
+  no `tests/__init__.py`, same as the Rust test-helper layout); PLAN.md
+  §8 verification updated accordingly.
+- One test-design bug caught and fixed on the first run: my
+  `test_mode_toggled_bails` fed a *valid* line before the toggle — the loop
+  correctly returns on the first valid line, so the toggle was unreachable;
+  the test now asserts the reachable toggle positions only.
+
+**Next (Phase 2)**
+
+- `stun.py`: RFC 5389 encode/parse (byte-identical layout), the `UdpSocket`
+  asyncio helper (the one socket), `discover_public_addr` — 7 ported tests +
+  a live round-trip against the local `tests/nat-sim/stun_server.py`.
