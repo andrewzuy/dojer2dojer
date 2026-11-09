@@ -267,3 +267,41 @@ Suite: 50 tests, all green.
 **Next (Phase 3)** — `punch.py`: simultaneous hole punching on the shared
 socket (500 ms interval, 30 s default timeout, first-packet rule), with
 the 3 Rust tests scaled down (30 s → 2 s).
+
+---
+
+## 2026-07-21 — Phase 3: hole punching
+
+**What happened**
+
+- `p2p_tunnel/punch.py` — direct port of Rust `src/punch.rs`:
+  - 8-byte random nonce sent to the peer every `max(interval_ms, 10)` ms;
+    first punch goes out at once (Rust's immediate first tick).
+  - Same socket as STUN (NAT binding continuity) and later QUIC.
+  - Datagrams from non-peer addresses ignored (debug-logged); recv `OSError`
+    treated as ICMP-unreachable noise and punching continues (the Windows
+    case, kept for parity).
+  - Success logged with from/bytes/sent/elapsed_ms, exactly as Rust.
+  - `PunchTimeout` message is Rust-byte-identical:
+    `"hole punching timed out after {N}s: no packet from {ip:port} (sent
+    {n} punch packets)"`; send failure → `PunchError("sending punch
+    packet: …")`.
+  - asyncio translation of Rust's 3-arm `select!`: per loop iteration, a
+    sleep-to-next-tick task and a recv task are raced with
+    `asyncio.wait(FIRST_COMPLETED)`; the loser is cancelled (a cancelled
+    recv loses nothing — datagrams wait in the kernel buffer).
+- Signature takes `interval_ms` / `timeout_secs` directly (not a full
+  `Config`) so tests can scale them; the pipeline passes config values.
+
+**Tests** — `tests/test_punch.py`: the 3 Rust tests ported
+(`punch_succeeds_when_peer_sends` with a 120 ms-delay fake peer,
+`punch_ignores_other_senders` with a 50 ms stranger + 150 ms real peer,
+`punch_times_out_without_peer` against 127.0.0.1:9 at 1 s as in Rust) plus
+two new: timeout message reports the actual sent count, and an eager peer
+answering before the first recv starts (kernel-buffer continuity).
+Suite: 55 tests, all green (2.2 s).
+
+**Next (Phase 4)** — `quic.py`: `cryptography`-generated self-signed
+cert (CN=`p2p-tunnel`), SHA-256 fingerprint, `QuicConfiguration` builders
+for both roles (client: `verify_mode=CERT_NONE`, `server_name="p2p-tunnel"`;
+keep-alive PING task since aioquic has no built-in interval).
