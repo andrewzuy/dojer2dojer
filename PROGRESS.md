@@ -198,3 +198,72 @@ single source of truth. Summary of the changes:
   (STUN → bridges) are unchanged content-wise.
 
 **Next (Phase 2)** — unchanged from the Phase 1 entry: `stun.py`.
+
+---
+
+## 2026-07-21 — Phase 2: STUN
+
+**What happened**
+
+- `p2p_tunnel/stun.py` — direct port of Rust `src/stun.rs`:
+  - Same constants (`DEFAULT_STUN_PORT = 19302`, magic `0x2112A442`,
+    msg types, attr types, 3 s per attempt, 2 rounds, 512-byte buffer).
+  - `encode_binding_request(txn) -> bytes` (20-byte header, no attrs).
+  - `parse_binding_response(data, txn, server) -> (host, port)` —
+    validates type/magic/txn in Rust order, walks attrs with 4-byte
+    padding, XOR-MAPPED-ADDRESS first with MAPPED-ADDRESS fallback,
+    v4 and v6 (v6 key = magic||txn).
+  - Error classes `StunRejected` / `StunMalformed` / `StunIo` keep the
+    Rust message wording (`"STUN server … rejected request: …"`,
+    `"malformed STUN response from …: …"`, `"I/O error talking to STUN
+    server …: …"`); discovery-level failure stays
+    `"STUN discovery failed: {last} (tried servers: …)"` for
+    `hint_for()` matching.
+  - `UdpSocket` — the one socket: STUN → punch → QUIC all share it.
+    `create()` binds `0.0.0.0:0` non-blocking; I/O via
+    `loop.sock_sendto` / `loop.sock_recvfrom`; `into_raw()` detaches the
+    underlying `socket.socket` for the QUIC handover
+    (`loop.create_datagram_endpoint(sock=…)`); context-manager support.
+  - `discover_public_addr(sock, servers)` — per-server, per-round loop;
+    `loop.getaddrinfo` for resolution (numeric literals work); ignores
+    datagrams from anyone other than the STUN server (the socket will
+    later carry punch traffic too).
+  - Logging mirrors the Rust tracing lines (debug: send/response;
+    warn: timeout/failure/unresolvable).
+- Project venv `.venv` (Python 3.14.8, `aioquic 1.7.2`) now used for all
+  gates.
+
+**Tests** — `tests/test_stun.py`: all 7 Rust tests ported
+(`encodes_binding_request`, both v4 mapped-attr parses, unknown-attr
+skip, wrong-txn rejection, non-STUN rejection, error-response rejection)
+plus: bad-magic rejection, no-mapped-attr rejection, v6
+XOR-MAPPED-ADDRESS round-trip (RFC key = magic||txn), txn-length guard,
+`resolve_server` (default port, explicit port, bad port, out-of-range,
+empty host, unresolvable), async loopback discovery against an in-test
+responder mirroring `nat-sim/stun_server.py`'s reply logic, stray-traffic
+ignored, unreachable-server error message contract, `UdpSocket`
+round-trip + `into_raw` detach, and a live test
+(`PTUN_LIVE_STUN=1`) against the real `stun.l.google.com:19302`.
+Suite: 50 tests, all green.
+
+**Gate verified**
+
+- `python -m compileall -q p2p_tunnel tests` — clean.
+- `python -m unittest discover -s tests` — 50 OK (1 skipped: live test).
+- Live: `PTUN_LIVE_STUN=1 … test_stun.py` →
+  `LIVE STUN: public address is 178.125.204.132:59942`.
+
+**Notes**
+
+- `tests/nat-sim/stun_server.py` only answers the netns-sim client IPs
+  (10.0.0.1 / 10.1.0.1) and programs iptables, so a loopback unit test
+  needs its own responder; the real server stays the Phase 15 fixture.
+- Three first-run test bugs caught: `IsolatedAsyncioTestCase` has no
+  `.loop` in 3.12+ (use `get_running_loop()`), my v6 test XORed against
+  the cookie instead of the 16-byte key (library was right), and the
+  echo test forgot the actual echo. `UdpSocket.__aenter__` had to be
+  `async def` (caught by the live test's `async with`).
+
+**Next (Phase 3)** — `punch.py`: simultaneous hole punching on the shared
+socket (500 ms interval, 30 s default timeout, first-packet rule), with
+the 3 Rust tests scaled down (30 s → 2 s).
