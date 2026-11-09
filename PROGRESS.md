@@ -305,3 +305,45 @@ Suite: 55 tests, all green (2.2 s).
 cert (CN=`p2p-tunnel`), SHA-256 fingerprint, `QuicConfiguration` builders
 for both roles (client: `verify_mode=CERT_NONE`, `server_name="p2p-tunnel"`;
 keep-alive PING task since aioquic has no built-in interval).
+
+---
+
+## 2026-07-21 — Phase 4: certificates + QUIC configuration
+
+**What happened**
+
+- `p2p_tunnel/quic.py` — port of the Phase-4 surface of Rust `src/quic.rs`:
+  - `CERT_CN = "p2p-tunnel"` (cert CN + DNS SAN, and the TLS SNI the
+    client sends — Rust: `endpoint.connect(peer_addr, CERT_CN)`).
+  - `generate_self_signed_cert() -> (cert_der, key, fingerprint)`:
+    fresh ECDSA P-256 self-signed cert via `cryptography` (rcgen's
+    equivalent), 30-day validity with 5 min start slack, fingerprint
+    logged for out-of-band comparison — same MVP security model as Rust
+    (client accepts any cert; humans compare fingerprints).
+  - `fingerprint(cert_der)` — SHA-256 hex, 64 lowercase chars.
+  - `build_client_config()` — `QuicConfiguration(is_client=True,
+    server_name=CERT_CN, verify_mode=ssl.CERT_NONE, idle_timeout=30.0)`.
+    CERT_NONE is the Python equivalent of Rust's
+    `AcceptAnyServerCert` (TLS 1.3 handshake signatures are still really
+    verified by `cryptography`). idle_timeout 30 s = quinn's default.
+  - `build_server_config(cert_der, key)` — presents our self-signed cert.
+  - `start_keep_alive(protocol, interval_secs)` — the Python equivalent of
+    Rust's `transport_config_with_keep_alive`: aioquic has no built-in
+    keep-alive interval, so a task calls `await protocol.ping()` every N
+    seconds and cancels itself when the connection dies; `None`/`<= 0`
+    disables.
+  - **ALPN:** verified the Rust side sets none (quinn default) ⇒ Python
+    sends none too, so Python↔Rust and Python↔Python handshakes agree.
+  - Endpoint attachment (create_endpoint/connect/accept) is Phase 5.
+
+**Tests** — `tests/test_quic.py`: the 4 Rust tests ported
+(`generates_cert_and_key`, `fingerprint_is_stable_and_distinct`,
+`client_and_server_configs_build`, keep-alive value acceptance) plus:
+P-256 key shape + CN/SAN content check, fresh key per call, no-ALPN
+parity, and a keep-alive task that stops pinging once the connection
+dies. Suite: 62 tests, all green.
+
+**Next (Phase 5)** — QUIC endpoint over the reused socket:
+`create_endpoint` via `loop.create_datagram_endpoint(sock=…)` with
+`QuicConnectionProtocol` (client) / `QuicServer` (server), `connect()`
+with `wait_connected()`, `accept()`, and a loopback handshake smoke test.
