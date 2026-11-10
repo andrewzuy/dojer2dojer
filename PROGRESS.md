@@ -347,3 +347,70 @@ dies. Suite: 62 tests, all green.
 `create_endpoint` via `loop.create_datagram_endpoint(sock=…)` with
 `QuicConnectionProtocol` (client) / `QuicServer` (server), `connect()`
 with `wait_connected()`, `accept()`, and a loopback handshake smoke test.
+
+---
+
+## 2026-07-21 — Phase 5: QUIC endpoint over the reused socket
+
+**What happened**
+
+- `p2p_tunnel/quic.py` part 2 — endpoint attachment (Rust `create_endpoint`/`connect` parity):
+  - `attach_client(sock, config, stream_handler=None)` — builds a
+    `QuicConnection` + `QuicConnectionProtocol` and hands **our punched
+    socket** to the event loop via `loop.create_datagram_endpoint(sock=…)`.
+    Same fd ⇒ the punched 4-tuple and its NAT mapping survive the
+    handover (this is the whole point of the shared socket).
+  - `attach_server(sock, config, stream_handler=None, on_connection=None)` —
+    instantiates aioquic's `QuicServer` (a plain `asyncio.DatagramProtocol`)
+    directly on our socket. aioquic has no quinn-style `accept()`: it
+    creates one `QuicConnectionProtocol` per peer connection, so
+    `on_connection` (a callback) is the notification hook — the pipeline
+    will use it to await the first connection.
+  - `connect(protocol, peer_addr, timeout=30)` — `protocol.connect(addr,
+    transmit=True)` + `wait_connected()`; timeout → `QuicError("QUIC
+    handshake with ip:port timed out after Ns")`; peer-terminated →
+    `QuicError("…failed: …")`.
+  - `close_endpoint(endpoint)` — closes connection(s) + datagram transport.
+    Verified asyncio's selector datagram transport **owns** the socket it
+    is handed and closes it ⇒ closing the endpoint fully releases the
+    shared socket for the supervisor's next fresh-socket attempt (v2
+    reconnect design).
+  - `peer_certificate_fingerprint(protocol)` — SHA-256 of the peer's leaf
+    cert for out-of-band comparison (client side). Reads aioquic's
+    private `_quic.tls._peer_certificate`; returns `None` if the API
+    moves (nice-to-have trust aid, not load-bearing).
+
+**Phase 4 bug found by Phase 5**
+
+- `build_server_config` put the DER bytes in `certificate_chain`, but
+  aioquic 1.7.2 requires the **leaf** in `configuration.certificate` as
+  an `x509.Certificate` object (chain = the rest). A server connection
+  with the old config raised `ValueError: SSL certificate is required
+  for a server`. Fixed + the config test now asserts the new shape.
+
+**Tests** — `tests/test_quic.py` gains `LoopbackHandshakeTests`:
+- `test_loopback_handshake_and_stream_roundtrip` — the Phase 5 done-when.
+  Two `UdpSocket`s, each **pre-used** with a real STUN Binding Request
+  round-trip (the `create_datagram_endpoint(sock=pre_used_sock)` path the
+  plan calls out), then `attach_server`/`attach_client`, real QUIC v1 +
+  TLS 1.3 handshake, server sees the connection as the first Initial
+  lands, client `create_stream` → server `stream_handler`, b"ping"/b"pong"
+  round-trip with half-close, peer cert fingerprint == our server
+  fingerprint (accept-any MVP model), keep-alive ping task alive on the
+  real connection, clean `close_endpoint` teardown.
+- `test_connect_times_out_against_closed_port` — handshake timeout →
+  `QuicError` with the "timed out" message.
+- **Documented deviation from Rust:** the Rust project skipped loopback
+  QUIC tests (quinn socket-ownership ambiguity); with aioquic + `sock=`
+  handover they are deterministic, so we run them (PLAN.md Phase 5).
+
+**Gate**
+
+- `python -m compileall -q p2p_tunnel tests` — clean
+- `python -m unittest discover -s tests -v` — **64 tests, all green**
+  (1 live STUN test skipped without `PTUN_LIVE_STUN=1`)
+
+**Next (Phase 6)** — client-side bridge: `tunnel.py` with `bridge_halves`
+(the 3 ported Rust tests) and `run_client_side` (127.0.0.1 TCP listener,
+per-connection QUIC stream), loopback e2e client side ↔ echo over real
+QUIC.
