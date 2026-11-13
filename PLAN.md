@@ -507,10 +507,18 @@ are deterministic → loopback attach of both sides, including the
 `create_datagram_endpoint(sock=pre_used_sock)` path (STUN datagram through
 it first). **Done-when:** loopback handshake green.
 
-### Phase 6 — Client-side bridge
-`tunnel.py`: `bridge_halves`, `run_client_side` (127.0.0.1 listener,
-per-connection stream). 3 ported bridge tests + loopback e2e (client side
-↔ echo over real QUIC). **Done-when:** green.
+### Phase 6 — Client-side bridge (implementation only)
+`tunnel.py`: `bridge_halves` (two-direction copy with half-close
+propagation), `run_client_side` (127.0.0.1 listener, per-connection
+stream). **Done-when:** code lands, compiles, committed suite stays
+green, verified by a loopback e2e check. (User decision: Phase 6 tests
+are separated into Phase 6b and committed separately.)
+
+### Phase 6b — Client-side bridge tests
+`tests/test_tunnel.py`: the 2 ported Rust `bridge_halves` tests (bytes
+both ways, half-close propagation) + an error-context test + the loopback
+e2e (client side ↔ echo over real QUIC). **Done-when:** green under the
+full suite.
 
 ### Phase 7 — Server-side bridge
 `run_server_side`: per incoming stream → TCP connect → bridge; unreachable

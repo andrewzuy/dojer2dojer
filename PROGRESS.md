@@ -414,3 +414,63 @@ with `wait_connected()`, `accept()`, and a loopback handshake smoke test.
 (the 3 ported Rust tests) and `run_client_side` (127.0.0.1 TCP listener,
 per-connection QUIC stream), loopback e2e client side ↔ echo over real
 QUIC.
+
+## 2026-11-12 — Phase 6: client-side bridge (implementation only)
+
+Per user decision the phase is split: **Phase 6 = implementation**
+(`bridge_halves` + `run_client_side`), the tests move to **Phase 6b**
+(separate commit). PLAN.md updated accordingly.
+
+**`p2p_tunnel/tunnel.py`**
+
+- `bridge_halves(read_a, write_a, read_b, write_b) -> (bytes_a, bytes_b)`
+  — Rust parity for `tunnel::bridge_halves`. Two independent copy tasks
+  (direction A: `read_a → write_a`, B: `read_b → write_b`), 64 KiB
+  chunks, `write_eof()` after EOF in each direction (half-close
+  propagation — one side's EOF does not kill the other direction),
+  `asyncio.gather(..., return_exceptions=True)`, first error (A before B)
+  surfaces as `TunnelError("copy <name>: <err>")` mirroring the Rust
+  `tokio::join!` + `context` ordering.
+- `run_client_side(protocol, listen_port)` — Rust parity for
+  `tunnel::run_client_side`. Binds `127.0.0.1:<port>` (loopback only),
+  one task per accepted TCP connection, each opens a **fresh
+  bidirectional QUIC stream** (concurrent connections are independent),
+  runs until `protocol.wait_closed()`, then stops the local listener.
+  Bind failure → `TunnelError` with the "is the port already in use?"
+  hint.
+- `_bridge_client_stream` — per-connection glue; errors are logged,
+  never raised (one bad local connection must not take down the tunnel).
+
+**Verification** — the full committed suite (64 tests) stayed green, and
+the implementation was verified end-to-end over **real QUIC loopback**
+(two `UdpSocket`s, `attach_server` echo handler, `attach_client` +
+`run_client_side`): handshake OK, local TCP listener OK, 12-byte echo
+round-trip OK, half-close/EOF propagation OK, `run_client_side` returns
+when the QUIC connection closes. (The throwaway check script was not
+committed — the permanent e2e test lands in Phase 6b.)
+
+**Known bugs in the deferred draft** (`tests/test_tunnel.py`, stays
+untracked until 6b):
+
+- `_MemPipe`/`_MemEnd` wiring is self-looping (each end's writer feeds
+  its own reader), so the in-memory bridge tests deadlock. Needs:
+  `end1.reader=_r1`/`end1.writer→_r2`, `end2.reader=_r2`/
+  `end2.writer→_r1`.
+- The e2e `on_stream` is `async def`, but aioquic calls the stream
+  handler **synchronously** (`quic_event_received` →
+  `self._stream_handler(reader, writer)`) — must be a sync function that
+  spawns the echo task (as `tests/test_quic.py` does).
+- The error-context test never feeds data into direction A, so the
+  failing writer is never reached; feed `half_a.reader` before the EOF.
+
+**Gate**
+
+- `python -m compileall -q p2p_tunnel tests` — clean
+- `python -m unittest tests.test_config tests.test_cli tests.test_stun
+  tests.test_punch tests.test_quic -v` — **64 tests, all green** (test
+  discovery over `tests/` includes the untracked draft, which is
+  intentional until 6b fixes it)
+- real-QUIC loopback implementation check — 5/5 passed
+
+**Next (Phase 6b)** — fix the three drafted-test bugs above, get
+`tests/test_tunnel.py` green, commit it separately.
