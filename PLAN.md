@@ -14,6 +14,13 @@ development log.
 > Rust code; where this document and the Rust code disagree about
 > *orchestration*, this document wins.
 
+> **HARD RULE (2026-11-15, absolute): every command executed on this
+> project — tests, builds, anything — MUST be restricted to at most
+> 5 minutes (300 s) of execution time** (`timeout 300 …` / harness
+> timeout=300). Never run anything unrestricted; long suites are run in
+> per-module batches under 5 minutes. See `MEMORY.md` Rule 1 and the
+> 2026-11-15 `PROGRESS.md` entry (5 h 58 m incident).
+
 ---
 
 ## 1. Goals

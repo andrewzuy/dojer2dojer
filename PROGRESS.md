@@ -2,8 +2,9 @@
 
 This is the development log for the Python rewrite (branch `python`).
 The Rust implementation on `main` is frozen and serves as the reference
-(oracle) — see `PLAN.md` for the full plan. Each entry is appended in
-chronological order; latest last.
+(oracle) — see `PLAN.md` for the full plan. Standing ground rules live
+in `MEMORY.md`. Each entry is appended in chronological order; latest
+last.
 
 ---
 
@@ -474,3 +475,30 @@ untracked until 6b):
 
 **Next (Phase 6b)** — fix the three drafted-test bugs above, get
 `tests/test_tunnel.py` green, commit it separately.
+
+---
+
+## 2026-11-15 — Incident: unrestricted test run (5 h 58 m); hard 5-minute rule added
+
+**What happened**
+
+- Ran `python -m compileall -q p2p_tunnel tests && python -m unittest
+discover -s tests` **without any execution-time limit**. Discovery
+pulled in the untracked, known-bugged draft `tests/test_tunnel.py`
+(self-looping `_MemPipe` → deadlocked test, flagged in the entry above),
+and the suite hung for **5 h 58 m 13 s** before being killed.
+- Operator rule (2026-11-15, absolute, repeated emphatically): **NEVER
+  execute a command / run tests without an execution-time restriction
+  of 5 minutes.**
+
+**Actions taken**
+
+- New `MEMORY.md` at the repo root — persistent ground rules for this
+  project; the 5-minute command limit is **Rule 1 (ABSOLUTE)** with the
+  incident recorded as its rationale.
+- The rule is also stated at the top of `PLAN.md` (block-quote, before
+  §1) and cross-linked from this file's header.
+- Going forward, in this project: every shell command carries a 300 s
+  limit (harness timeout or `timeout 300 …`); long suites are run in
+  per-module batches, each under 5 minutes; daemons/mock servers are
+  started under `timeout` or killed explicitly.
