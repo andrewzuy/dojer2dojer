@@ -502,3 +502,62 @@ and the suite hung for **5 h 58 m 13 s** before being killed.
   limit (harness timeout or `timeout 300 …`); long suites are run in
   per-module batches, each under 5 minutes; daemons/mock servers are
   started under `timeout` or killed explicitly.
+
+---
+
+## 2026-11-15 — Phase 7 — Server-side bridge (`run_server_side`) + the client-first QUIC stream lesson
+
+**What happened**
+
+- Implemented `run_server_side` + `ServerEndpoint`
+  (`p2p_tunnel/tunnel.py`): each incoming QUIC stream → TCP connect to
+  the configured private target → `bridge_halves` both ways with
+  half-close propagation; unreachable target → warning log + FIN
+  (stream-level only, the connection survives — v2 semantics).
+  `quic.attach_server` takes an optional `server_endpoints` list the
+  connection handler fills with a `ServerEndpoint(protocol)` per
+  accepted connection (aioquic has no quinn-style `accept_bi()` loop —
+  streams arrive via the `stream_handler` callback instead).
+- The first e2e draft deadlocked (killed by the 300 s limit) — the root
+  cause is a general QUIC fact, not an aioquic bug: **a QUIC stream is
+  invisible to the peer until the first frame carrying its stream ID
+  arrives; there is no empty OPEN frame**. In quinn-proto
+  (`Streams::open` / `StreamsState::insert` / `write_stream_frames`) and
+  in aioquic (`quic_event_received` → `_stream_handler` only on
+  `StreamDataReceived`) the peer's stream handling starts on the first
+  byte, not on "stream open". The draft test waited for the echo
+  target's banner *before sending anything* → the server never saw the
+  stream → never connected to the target → no banner → deadlock.
+- Consequence (documented in the test module + `run_server_side`
+  docstrings): the tunnel is **client-first by nature**. The Rust
+  `tests/nat-sim` drill works because `probe_client.py` sends
+  `hello\n` first; every Python e2e test now writes before it reads.
+
+**Actions taken**
+
+- Wrote `tests/test_tunnel_server.py` (6 tests), all client-first:
+  - In-memory (fake protocol + in-memory pipe, no QUIC): unreachable
+    target → FIN only; bytes + half-close round-trip through an
+    in-process echo target.
+  - Real-QUIC loopback e2e: bytes round-trip through the echo target;
+    unreachable target → FIN only and the connection still serves a
+    second stream; concurrent streams independent (interleaved
+    write-before-read per stream).
+  - Done-when drill: raw TCP socket (standing in for `nc`) through a
+    loopback tunnel → out-of-process `tests/nat-sim/echo_target.py` →
+    banner + echo.
+- `run_server_side`'s FIN path now also handles an async
+  `write_eof()` (returns a coroutine), mirroring `bridge_halves`'
+  adapter contract.
+
+**Verified (every command under the 5-minute rule)**
+
+- `python -m unittest tests.test_tunnel_server -v` — 6/6 green (0.5 s).
+- `python -m unittest tests.test_tunnel tests.test_tunnel_server` — 10/10.
+- `python -m unittest tests.test_config tests.test_cli tests.test_stun
+  tests.test_punch tests.test_quic` — 64 tests green (1 skipped, opt-in
+  live STUN).
+- Committed suite total: **74 tests, all green**.
+
+**Next (Phase 8)** — Telegram signaling: `telegram.py` per PLAN.md
+§5.3 + the ported Rust classify suite against the mock bot API.

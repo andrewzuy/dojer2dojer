@@ -172,6 +172,7 @@ async def attach_server(
     config: QuicConfiguration,
     stream_handler: object | None = None,
     on_connection: object | None = None,
+    server_endpoints: list | None = None,
 ) -> QuicServer:
     """Attach aioquic to a pre-bound UDP socket as the QUIC **server**.
 
@@ -183,16 +184,28 @@ async def attach_server(
     server creates one ``QuicConnectionProtocol`` per peer. Pass
     ``on_connection`` (called synchronously with each new
     ``QuicConnectionProtocol``) to be told about them — the pipeline uses
-    it to await the first connection.
+    it to await the first connection. Pass ``server_endpoints`` (a list)
+    and the server appends a :class:`p2p_tunnel.tunnel.ServerEndpoint`
+    per peer so the tunnel server can await the connection close and
+    rebind the stream handler (see ``tunnel.run_server_side``).
     """
     loop = asyncio.get_running_loop()
-    if on_connection is None:
+    if on_connection is None and server_endpoints is None:
         server = QuicServer(configuration=config, stream_handler=stream_handler)
     else:
 
-        def _create_protocol(connection: QuicConnection, stream_handler=stream_handler):
+        def _create_protocol(
+            connection: QuicConnection,
+            stream_handler=stream_handler,
+        ):
             protocol = QuicConnectionProtocol(connection, stream_handler=stream_handler)
-            on_connection(protocol)
+            if on_connection is not None:
+                on_connection(protocol)
+            if server_endpoints is not None:
+                # Imported here to avoid a quic ↔ tunnel import cycle.
+                from .tunnel import ServerEndpoint
+
+                server_endpoints.append(ServerEndpoint(protocol))
             return protocol
 
         server = QuicServer(
