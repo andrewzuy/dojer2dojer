@@ -293,6 +293,12 @@ def start_keep_alive(
     ``interval_secs <= 0`` or ``None`` disables keep-alive. Start this only
     after the connection is established; the task cancels itself when the
     connection goes away.
+
+    The caller MUST keep a strong reference to the returned task: the
+    event loop only keeps weak references to tasks, and a keep-alive
+    task that parks on ``asyncio.sleep`` is exactly the kind of task
+    that can be garbage-collected mid-execution (silently stopping all
+    PINGs).
     """
     if not interval_secs or interval_secs <= 0:
         return None

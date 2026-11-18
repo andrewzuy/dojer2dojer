@@ -191,6 +191,10 @@ class ClientSideE2ETests(unittest.IsolatedAsyncioTestCase):
         # (quic_event_received → self._stream_handler(reader, writer)), so
         # this must be a plain function that spawns the echo task — not an
         # async def (whose coroutine would be created and never awaited).
+        # Strong references to echo tasks: the event loop only keeps weak
+        # references, and a GC'd task would silently close the stream.
+        echo_tasks: set[asyncio.Task] = set()
+
         def on_stream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             async def echo() -> None:
                 try:
@@ -208,7 +212,9 @@ class ClientSideE2ETests(unittest.IsolatedAsyncioTestCase):
                     except Exception:
                         pass
 
-            asyncio.create_task(echo())
+            task = asyncio.create_task(echo())
+            echo_tasks.add(task)
+            task.add_done_callback(echo_tasks.discard)
 
         server = await attach_server(
             server_sock.into_raw(),

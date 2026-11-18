@@ -72,6 +72,13 @@ class _EchoTarget:
         self.port: int | None = None
         self.echoed: list[int] = []
         self._pending: list[asyncio.Future] = []
+        # Strong references to serve tasks. The event loop only keeps weak
+        # references to tasks; if a serve task were garbage-collected mid-
+        # execution its ``finally: writer.close()`` would still run (closing
+        # the target connection) while the future is never completed, so
+        # ``wait_all_done`` would hang. (Observed on CPython 3.14: the
+        # concurrent-streams e2e test failed 100% without this.)
+        self._tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._accept_conn, "127.0.0.1", 0)
@@ -82,7 +89,9 @@ class _EchoTarget:
     ) -> None:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending.append(fut)
-        asyncio.create_task(self._serve_conn(reader, writer, fut))
+        task = asyncio.create_task(self._serve_conn(reader, writer, fut))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def _serve_conn(
         self,

@@ -561,3 +561,103 @@ and the suite hung for **5 h 58 m 13 s** before being killed.
 
 **Next (Phase 8)** — Telegram signaling: `telegram.py` per PLAN.md
 §5.3 + the ported Rust classify suite against the mock bot API.
+
+## 2026-11-18 — Phase 8 — Telegram signaling (`TelegramChannel`) + the task-GC lesson
+
+**Context** — Phase 7 was committed/pushed green; user said "Proceed with
+next phase". Phase 8 per PLAN.md §5.3: the bot-to-bot signaling layer.
+
+**Implementation** — `p2p_tunnel/telegram.py` (stdlib only: `urllib`,
+`json`, `asyncio`):
+
+- PTUN v1.1 lines: `PTUN v1 host:port` (v4 bare / v6 bracketed),
+  `PTUN READY <secret>` (v1.1 readiness handshake), `PTUN ROLE
+  client|server` (v1.1 explicit role; replaces the legacy
+  "addr ⇒ server" inference). Builders raise on invalid input; unknown
+  prefixes are ignored at parse time.
+- `TelegramChannel`: one long-lived channel per process (the PLAN.md v2
+  divergence from Rust's one-shot attempt object). `start()` = `getMe`
+  (own bot id) + background `getUpdates` poll loop (10 s long-poll,
+  blocking `urllib` via `run_in_executor`). `PTUN_TELEGRAM_API_BASE`
+  env override for the mock API.
+- Classification rules (ported from Rust `telegram.rs`): own-bot echo
+  ignored; non-bot sender debug-ignored; unexpected bot sender
+  warn-ignored; `date > 0` and older than 600 s → stale, ignored
+  (`date == 0`/absent accepted — the mock API uses 0).
+- Offset cursor: `offset` starts at 0 and advances to
+  `last update_id + 1`, so a simulated "attempt 2" (a later wait
+  round) only sees updates delivered after the previous attempt.
+  Matches real Bot API semantics (`update_id >= offset`).
+- Per-kind FIFO line buffers (`ready`/`role`/`addr`, capped at 16):
+  every classified line is recorded the moment the poll loop processes
+  it, and the *first* waiter of that kind takes the oldest acceptable
+  line — at registration or as it arrives. This makes waiters robust
+  against the race where the poll loop processes a line before the
+  waiter registers (e.g. `wait_role()` after `wait_ready()` returned),
+  while each line is still consumed exactly once.
+- Waiters: `wait_ready(secret=…)` (secret required — an empty secret
+  is a config error; wrong-secret lines keep waiting), `wait_role()`
+  (2 s grace, then `None` = legacy peer with no role line),
+  `wait_addr(timeout=cfg)`. `TelegramTimeoutError` on expiry.
+- Error paths: `send()` on `ok=false` raises `TelegramError` with
+  Bot-to-Bot-mode + `peer_bot_id` guidance; the poll loop survives
+  transient `getUpdates` failures (keeps polling, no reconnect logic —
+  Phase 11's job).
+
+**Tests** — `tests/test_telegram.py`, 47 tests, three layers:
+
+1. Ported Rust classify suite (v1 addr line, READY line, ROLE line)
+   against `parse_update` + `classify`, incl. the legacy
+   no-ROLE → `None` fallback.
+2. Async channel tests against an in-process programmable Bot API mock
+   (`PTUN_TELEGRAM_API_BASE`): getMe, send/echo recording, addr
+   round-trip with own-echo ignored, stale-line ignored, wrong-secret
+   ready times out, wait timeouts, late ROLE line still recorded,
+   line processed *before* the waiter registered is still delivered,
+   duplicate lines: first fresh match wins, extras stay queued;
+   offset freshness across a simulated attempt 2 (attempt 1's READY
+   never re-delivered; attempt 2 sees only new lines; missing new
+   ROLE → `None`); `send ok=false` raises and recovers after the flag
+   clears; `getMe` failure raises; poll loop survives `getUpdates`
+   failure (mock stopped, restarted on a new port, repointed).
+3. e2e against the unmodified committed `tests/telegram/mock_bot_api.py`
+   spawned as a subprocess: `getMe → send_addr → wait_addr`.
+
+**Regression found & fixed — the task-GC lesson.** The Phase 7 suite
+went red mid-Phase-8 (`test_concurrent_streams_are_independent` failed
+100%, ~10 s timeout; "Task was destroyed but it is pending!" pointing
+at `_EchoTarget._serve_conn`), while an identical `asyncio.run()`
+repro passed. Root cause: `_EchoTarget._accept_conn` did
+`asyncio.create_task(self._serve_conn(...))` **without keeping a
+strong reference**. On CPython 3.14 the parked task is
+garbage-collected mid-execution: `coro.close()` throws `GeneratorExit`
+at the suspension point, `finally: writer.close()` runs (closing the
+target connection — so the tunnel bridge sees clean EOF and completes,
+which is why the tunnel side looked fine) but the per-connection
+future is never completed (`GeneratorExit` is not an `Exception`), so
+`wait_all_done` hangs. It was green in Phase 7 because task
+collectability depends on allocation-count GC timing, not on anything
+in the tunnel — the asyncio docs have always said "the event loop only
+keeps weak references to tasks; save a reference to avoid a task
+disappearing mid-execution".
+
+- Fix: strong refs in `_EchoTarget` (`self._tasks` set +
+  `add_done_callback(discard)`), matching what `run_client_side` /
+  `run_server_side` already do. Same latent pattern fixed in
+  `tests/test_tunnel.py`'s client-side echo. `start_keep_alive`
+  (quic.py) docstring now says the caller must keep the returned task
+  alive (it returns a task that parks on `asyncio.sleep`).
+- Verification: failing test 0/3 → 3/3 (~0.14 s each); full tunnel
+  batch `exit=124` (hang) → 10/10 in 0.7 s.
+
+**Verified (every command under the 5-minute rule)**
+
+- `python -m unittest tests.test_telegram` — 47/47 green (13.8 s).
+- `python -m unittest tests.test_config tests.test_cli` — 26 green.
+- `python -m unittest tests.test_stun tests.test_punch
+  tests.test_quic` — 38 green (1 skipped, opt-in live STUN).
+- `python -m unittest tests.test_tunnel tests.test_tunnel_server` —
+  10/10 green.
+- Committed suite total: **121 tests, all green**.
+
+**Next (Phase 9)** — Role model + setup + CLI v2 (D1, D2, D5).
