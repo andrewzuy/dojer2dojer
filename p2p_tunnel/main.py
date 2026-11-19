@@ -20,7 +20,8 @@ def main(argv: list[str] | None = None) -> int:
         "The pipeline is being ported phase by phase — see PLAN.md and "
         "PROGRESS.md in the repository.\n"
         f"(parsed args: config={cli.config}, telegram={cli.telegram}, "
-        f"tui={cli.tui}, no_tui={cli.no_tui}, verbose={cli.verbose})",
+        f"manual={cli.manual}, tui={cli.tui}, no_tui={cli.no_tui}, "
+        f"verbose={cli.verbose})",
         file=sys.stderr,
     )
     return 0

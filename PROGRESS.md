@@ -661,3 +661,107 @@ disappearing mid-execution".
 - Committed suite total: **121 tests, all green**.
 
 **Next (Phase 9)** — Role model + setup + CLI v2 (D1, D2, D5).
+
+## 2026-11-18 — Phase 9 — Role model + setup + CLI v2 (D1, D2, D5)
+
+**Context** — Phase 8 was committed/pushed green; user said "Proceed with
+phase 9". Phase 9 per PLAN.md §5.2/§5.7: the v2 role model, exchange-mode
+resolution, and the S1 setup prompts — the "focused diff" on `cli.py`
+deferred since Phase 1.
+
+**Implementation**
+
+- `p2p_tunnel/role.py` (new):
+  - `Role` enum (`CLIENT`/`SERVER`) with `opposite`, `as_str`,
+    `from_str` (case-insensitive, trimmed; `ValueError` on unknown).
+  - `check_compatible(ours, theirs)` (D1 cross-check): raises
+    `RoleConflict` — `"role misconfiguration: both sides selected
+    '<role>'"` — when both sides selected the same role. Message carries
+    the `"role misconfiguration"` hint substring (PLAN §4).
+  - `role_from_ip_order(own, peer)` — the legacy Rust rule kept verbatim
+    (D4 fallback + oracle): total order over `(family, 16-byte)`, IPv4
+    (family 4, octets in last 4 bytes) before IPv6 (family 6); equal IP →
+    lower port wins (`<=`, so a perfect tie → server).
+- `p2p_tunnel/config.py`:
+  - `validate_for_role(cfg, role)` (D5, role-aware validation, runs after
+    the role is known): client ⇒ `local_tcp_listen_port` set, server ⇒
+    `remote_target_addr` set; `ConfigError` with the canonical
+    "``…`` is required for the <role> role" message (hint substring
+    `"is required for the"`).
+- `p2p_tunnel/cli.py`:
+  - New flags `--manual` / `--no-telegram` (argparse alias pair, same
+    `dest`). Original flags unchanged (Phase 1 v2 note honored).
+  - `ExchangeMode` enum + `resolve_exchange_mode(cli, cfg)` — pure,
+    unit-tested (D2): `--manual`/`--no-telegram` → MANUAL; `--telegram`
+    → TELEGRAM or `ExchangeModeError` with hint when the config has no
+    `[telegram]` table; no flag → **TELEGRAM if a `[telegram]` table is
+    configured, else MANUAL**.
+  - S1 setup prompts on the existing `PromptOutcome` contract (TUI in
+    Phase 12): `prompt_role(read)` (default `client`; accepts
+    `client`/`c`/`server`/`s` case-insensitive, empty = default),
+    `prompt_local_port(read, prefilled)` (empty = prefill from config;
+    re-prompts otherwise; 1..65535), `prompt_server_target(read,
+    prefilled)` (same, `ip:port`; an invalid prefill re-prompts instead
+    of crashing). All bail with the usual `PromptBail` subclasses
+    (`ModeToggled`/`Aborted`/`Eof`) and map `OSError` → `Aborted`, like
+    `prompt_peer_addr`.
+  - `Setup` frozen dataclass (role + `local_port`/`target`) and
+    `resolve_setup(cfg, read, *, interactive)`: interactive → the two
+    prompts above (values live in the returned `Setup`; the config file
+    is not modified); non-interactive → no prompts, role inferred from
+    the config (exactly one of the two role keys set; both → ambiguous
+    `ConfigError`, neither → `ConfigError`; invalid `remote_target_addr`
+    → `ConfigError` since there is no one to re-prompt).
+- `p2p_tunnel/main.py`: stub's parsed-args line now includes `manual`
+  (truthful output until Phase 10 replaces the body).
+
+**Design decisions (not pinned by the plan — recorded for review)**
+
+- Non-interactive role inference: exactly one of
+  `local_tcp_listen_port`/`remote_target_addr` set ⇒ that role; both set
+  ⇒ ambiguous error (v2 requires an explicit role; a non-interactive run
+  has no prompt to disambiguate); neither set ⇒ error. The plan only
+  pins the interactive prompt path and the "is required for the … role"
+  hard error, so this is an interpretation, kept conservative.
+- No `PuntunnelError` base class introduced: the established
+  per-module pattern (`ConfigError`, `TelegramError`, … all direct
+  `Exception` subclasses) is kept; `RoleConflict` follows it. The plan's
+  §4 "PuntunnelError base" remains a candidate refactor, not part of this
+  focused diff.
+- `check_compatible` raises `RoleConflict` (message per PLAN §5.2 wording
+  "both sides selected 'server'"); the TUI-facing phrasing
+  "both sides are <role>" (PLAN §2) is a Phase 12 concern.
+
+**Tests** — `tests/test_role.py` (new, 15 tests): the 5 Rust `role.rs`
+oracle tests ported unchanged (`v4_lower_is_server`,
+`roles_are_always_opposite`, `v4_always_beats_v6`,
+`v6_orders_numerically`, `same_ip_falls_back_to_port`) + tie-break guard
++ `Role` enum + `check_compatible` conflict matrix (both roles, exact
+messages, hint substring). `tests/test_cli.py` extended: `--manual` /
+`--no-telegram` parsing, the full 7-case mode-resolution matrix
+(including `--telegram`-without-table → error with hint), role/port/
+target prompt behavior (prefill, re-prompt, bail propagation, messages),
+`resolve_setup` interactive + non-interactive matrix, stdin transport.
+`tests/test_config.py` extended: `validate_for_role` (both roles, exact
+"… is required for the … role" messages, hint substring, cross-role keys
+don't satisfy).
+
+**Verified** (every command ≤ 5 min per MEMORY.md Rule 1)
+
+- `python -m compileall -q p2p_tunnel tests` — clean.
+- `tests.test_role tests.test_cli tests.test_config` — 95 OK.
+- `tests.test_stun tests.test_punch tests.test_quic` — 38 OK (1 skipped,
+  opt-in live STUN).
+- `tests.test_tunnel tests.test_tunnel_server` — 10 OK.
+- `tests.test_telegram` — 47 OK.
+- **Total: 190 tests, all green.**
+- Done-when manual verification: `p2p-tunnel --help` shows
+  `--manual, --no-telegram`; `p2p-tunnel --manual` / `--no-telegram`
+  parse `manual=True`, no-flag run `manual=False`; default-mode
+  resolution checked end-to-end against real config files (6/6: no table
+  → MANUAL, table → TELEGRAM, `--telegram` without table → error with
+  hint, `--manual`/`--no-telegram` force MANUAL regardless).
+
+**Next (Phase 10)** — Pipeline wiring v1: the §2 flow (S0→T6), the
+supervisor-free single attempt, `hint_for()`, exit codes, `main.py`
+replaces the Phase 1 stub.

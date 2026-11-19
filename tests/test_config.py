@@ -13,7 +13,9 @@ from p2p_tunnel.config import (
     DEFAULT_TELEGRAM_TIMEOUT_SECS,
     Config,
     ConfigError,
+    validate_for_role,
 )
+from p2p_tunnel.role import Role
 
 
 def write_temp_toml(text: str) -> Path:
@@ -173,6 +175,55 @@ some_future_key = 42
         self.assertEqual(DEFAULT_PUNCH_TIMEOUT_SECS, 30)
         self.assertEqual(DEFAULT_KEEP_ALIVE_INTERVAL_SECS, 5)
         self.assertEqual(DEFAULT_TELEGRAM_TIMEOUT_SECS, 120)
+
+
+class ValidateForRoleTests(unittest.TestCase):
+    """Role-aware validation (v2, D5) — runs after the role is known."""
+
+    def cfg(self, **kw) -> Config:
+        base = dict(stun_servers=["stun.l.google.com:19302"])
+        base.update(kw)
+        return Config(**base)
+
+    def test_client_with_port_passes(self):
+        validate_for_role(self.cfg(local_tcp_listen_port=1234), Role.CLIENT)
+
+    def test_client_without_port_raises(self):
+        with self.assertRaises(ConfigError) as ctx:
+            validate_for_role(self.cfg(), Role.CLIENT)
+        msg = str(ctx.exception)
+        self.assertIn("local_tcp_listen_port", msg)
+        self.assertIn("is required for the client role", msg)
+
+    def test_server_with_addr_passes(self):
+        validate_for_role(self.cfg(remote_target_addr="1.2.3.4:5"), Role.SERVER)
+
+    def test_server_without_addr_raises(self):
+        with self.assertRaises(ConfigError) as ctx:
+            validate_for_role(self.cfg(), Role.SERVER)
+        msg = str(ctx.exception)
+        self.assertIn("remote_target_addr", msg)
+        self.assertIn("is required for the server role", msg)
+
+    def test_client_ignores_server_key_and_vice_versa(self):
+        # Only the role's own key is required; the other key is irrelevant.
+        validate_for_role(self.cfg(local_tcp_listen_port=1), Role.CLIENT)
+        validate_for_role(self.cfg(remote_target_addr="9.9.9.9:1"), Role.SERVER)
+        # Cross-set keys do not satisfy the requirement.
+        with self.assertRaises(ConfigError):
+            validate_for_role(self.cfg(remote_target_addr="9.9.9.9:1"), Role.CLIENT)
+        with self.assertRaises(ConfigError):
+            validate_for_role(self.cfg(local_tcp_listen_port=1), Role.SERVER)
+
+    def test_error_messages_match_hint_substring(self):
+        # The hint matcher keys on "is required for the" (PLAN §4).
+        for cfg, role in (
+            (self.cfg(), Role.CLIENT),
+            (self.cfg(), Role.SERVER),
+        ):
+            with self.assertRaises(ConfigError) as ctx:
+                validate_for_role(cfg, role)
+            self.assertIn("is required for the", str(ctx.exception))
 
 
 if __name__ == "__main__":

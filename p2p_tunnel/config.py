@@ -21,6 +21,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from p2p_tunnel.role import Role
+
 DEFAULT_PUNCH_INTERVAL_MS = 500
 DEFAULT_PUNCH_TIMEOUT_SECS = 30
 DEFAULT_KEEP_ALIVE_INTERVAL_SECS = 5
@@ -170,4 +172,24 @@ class Config:
             local_tcp_listen_port=local_tcp_listen_port,
             remote_target_addr=remote_target_addr,
             telegram=telegram,
+        )
+
+
+def validate_for_role(cfg: Config, role: Role) -> None:
+    """Role-aware validation (v2, D5) — run after the role is known (S1).
+
+    * client role ⇒ ``local_tcp_listen_port`` must be set
+    * server role ⇒ ``remote_target_addr`` must be set
+
+    Raises :class:`ConfigError` with the canonical
+    "``… is required for the <role> role``" message — the hint matcher
+    keys on the ``"is required for the"`` substring (PLAN §4).
+    """
+    if role is Role.CLIENT and cfg.local_tcp_listen_port is None:
+        raise ConfigError(
+            "config: `local_tcp_listen_port` is required for the client role"
+        )
+    if role is Role.SERVER and not cfg.remote_target_addr:
+        raise ConfigError(
+            "config: `remote_target_addr` is required for the server role"
         )
