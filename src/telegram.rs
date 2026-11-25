@@ -21,6 +21,10 @@
 //!
 //! ```text
 //! PTUN READY <secret>     ; "I'm up and listening" (sent at startup, before STUN)
+//! PTUN ROLE <client|server>
+//!                         ; role declaration (v1.1, optional; sent right after
+//!                         ; READY; legacy peers ignore it — its absence means
+//!                         ; "IP-derived fallback" on the other side)
 //! PTUN v1 <ip:port>       ; the public address (sent only after the READY handshake)
 //! ```
 //!
@@ -59,6 +63,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::config::TelegramConfig;
+use crate::role::Role;
 
 /// Marker line format shared with the peer: `PTUN v1 <ip:port>`.
 const PAYLOAD_PREFIX: &str = "PTUN v1 ";
@@ -66,6 +71,14 @@ const PAYLOAD_PREFIX: &str = "PTUN v1 ";
 /// Marker line for the "I'm up, come find me" readiness handshake that must
 /// complete before either side announces an address (see [`handshake`]).
 const READY_PREFIX: &str = "PTUN READY ";
+
+/// Marker line for the role declaration (v1.1), sent right after READY.
+const ROLE_PREFIX: &str = "PTUN ROLE ";
+
+/// How long after the READY handshake we keep listening for a late `PTUN
+/// ROLE` line before concluding the peer is legacy (v1) and falling back to
+/// the IP-derived role.
+const ROLE_GRACE_SECS: u64 = 2;
 
 /// How long `handshake` waits for the peer bot's `PTUN READY` line before
 /// giving up (falling back to the manual address prompt).
@@ -182,6 +195,25 @@ impl Telegram {
         Ok(id)
     }
 
+    /// Send our `PTUN ROLE <client|server>` line (v1.1), right after READY.
+    /// A legacy peer simply ignores the unknown line.
+    pub async fn send_role(&self, role: Role) -> anyhow::Result<()> {
+        let text = format!("{ROLE_PREFIX}{role}");
+        let chat_id = self.peer_bot_id.to_string();
+        let fields: [(&str, &str); 2] = [("chat_id", &chat_id), ("text", &text)];
+        self.call_with::<serde_json::Value>("sendMessage", &fields)
+            .await
+            .with_context(|| {
+                format!(
+                    "sending our PTUN ROLE line to peer bot {} — is Bot-to-Bot Communication \
+                     Mode enabled for BOTH bots in @BotFather?",
+                    self.peer_bot_id
+                )
+            })?;
+        info!(peer_bot_id = self.peer_bot_id, line = %text, "sent PTUN ROLE");
+        Ok(())
+    }
+
     /// Announce our address to the peer bot.
     ///
     /// Send this *after* [`handshake`](Self::handshake) succeeded — i.e. once
@@ -257,7 +289,7 @@ impl Telegram {
 
             let res = tokio::time::timeout(
                 poll + Duration::from_secs(15), // client-side guard vs. a stuck read
-                self.fetch_updates(),
+                self.fetch_updates(GET_UPDATES_TIMEOUT_SECS),
             )
             .await;
 
@@ -310,6 +342,30 @@ impl Telegram {
         cfg: &TelegramConfig,
         is_aborted: impl Fn() -> bool + Send,
     ) -> anyhow::Result<()> {
+        self.handshake_with_role(cfg, None, is_aborted)
+            .await
+            .map(|_| ())
+    }
+
+    /// The readiness handshake *plus* role declaration exchange (v1.1).
+    ///
+    /// Sends `PTUN READY <secret>`; if `our_role` is `Some`, immediately
+    /// follows it with `PTUN ROLE <client|server>` (a legacy peer ignores the
+    /// unknown line). Then waits for the peer's READY line — required, so a
+    /// timeout is an error — capturing any `PTUN ROLE` line from the peer.
+    /// If the peer's role has not arrived by the time READY does, a short
+    /// grace window ([`ROLE_GRACE_SECS`]) keeps listening for a late ROLE
+    /// line before concluding the peer is legacy.
+    ///
+    /// Returns the peer's declared role, or `None` when the peer is legacy
+    /// (no ROLE line within the grace) or when we did not declare one
+    /// ourselves.
+    pub async fn handshake_with_role(
+        &mut self,
+        cfg: &TelegramConfig,
+        our_role: Option<Role>,
+        is_aborted: impl Fn() -> bool + Send,
+    ) -> anyhow::Result<Option<Role>> {
         let secret = cfg
             .secret
             .as_deref()
@@ -339,16 +395,21 @@ impl Telegram {
                     self.peer_bot_id
                 )
             })?;
+        if let Some(role) = our_role {
+            self.send_role(role).await?;
+        }
         info!(
             peer_bot_id = self.peer_bot_id,
-            "sent PTUN READY; waiting for the peer bot to confirm it is up (q / Esc / Ctrl-C to cancel)"
+            ?our_role,
+            "sent PTUN READY (+ role); waiting for the peer bot to confirm it is up (q / Esc / Ctrl-C to cancel)"
         );
 
+        // Wait for the peer's READY (required); capture any peer ROLE line
+        // that arrives in flight (it may beat the READY line to us).
+        let mut early_role: Option<Role> = None;
+        let mut ready = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(READY_TIMEOUT_SECS);
-        loop {
-            if is_aborted() {
-                return Err(anyhow::Error::from(TelegramError::Aborted));
-            }
+        while !ready && !is_aborted() {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(anyhow::Error::from(TelegramError::Timeout {
@@ -361,7 +422,7 @@ impl Telegram {
 
             let res = tokio::time::timeout(
                 poll + Duration::from_secs(15), // client-side guard vs. a stuck read
-                self.fetch_updates(),
+                self.fetch_updates(GET_UPDATES_TIMEOUT_SECS),
             )
             .await;
 
@@ -380,17 +441,129 @@ impl Telegram {
             for msg in updates {
                 // Track the highest update id we've seen so the next poll
                 // starts strictly after it — no re-delivery. (The same
-                // `Telegram` instance is reused for `wait_peer_addr`, whose
-                // offset picks up right where this loop left off.)
+                // `Telegram` instance is the long-lived channel: it is
+                // reused across supervisor attempts, and `wait_peer_addr`
+                // picks up right where this loop left off.)
                 if msg.update_id + 1 > self.seen {
                     self.seen = msg.update_id + 1;
                 }
+                if early_role.is_none() {
+                    early_role = self.classify_role(&msg, own_id);
+                }
                 if self.classify_ready(&msg, own_id, &secret) {
-                    info!("peer bot confirmed it is up — the readiness handshake is complete");
-                    return Ok(());
+                    ready = true;
+                    break;
                 }
             }
         }
+        if is_aborted() {
+            return Err(anyhow::Error::from(TelegramError::Aborted));
+        }
+        info!("peer bot confirmed it is up — the readiness handshake is complete");
+
+        // Role grace: only meaningful when we declared a role ourselves.
+        let peer_role = match early_role {
+            Some(r) => Some(r),
+            None if our_role.is_some() => self.wait_role_grace(own_id, is_aborted).await?,
+            None => None,
+        };
+        match peer_role {
+            Some(r) => info!(?r, "peer role declared"),
+            None if our_role.is_some() => debug!(
+                "no PTUN ROLE from peer within {ROLE_GRACE_SECS}s — legacy peer? IP-derived fallback applies"
+            ),
+            None => {}
+        }
+        Ok(peer_role)
+    }
+
+    /// After READY completed, keep listening for up to [`ROLE_GRACE_SECS`] for
+    /// a late `PTUN ROLE` line. Returns `None` for legacy peers or when the
+    /// grace expires; [`TelegramError::Aborted`] if the user cancels.
+    async fn wait_role_grace(
+        &mut self,
+        own_id: i64,
+        is_aborted: impl Fn() -> bool + Send,
+    ) -> anyhow::Result<Option<Role>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(ROLE_GRACE_SECS);
+        loop {
+            if is_aborted() {
+                return Err(anyhow::Error::from(TelegramError::Aborted));
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            // Short server-side long-poll so the grace stays tight (a full
+            // 10 s poll would overshoot a 2 s window badly).
+            let poll = remaining.min(Duration::from_secs(ROLE_GRACE_SECS));
+
+            let res = tokio::time::timeout(
+                poll + Duration::from_secs(15), // client-side guard vs. a stuck read
+                self.fetch_updates(ROLE_GRACE_SECS),
+            )
+            .await;
+
+            let updates = match res {
+                Ok(Ok(updates)) => updates,
+                Ok(Err(e)) => {
+                    warn!(error = %e, "getUpdates failed during role grace; retrying");
+                    continue;
+                }
+                Err(_) => {
+                    warn!("getUpdates hung past its guard during role grace; retrying");
+                    continue;
+                }
+            };
+
+            for msg in updates {
+                if msg.update_id + 1 > self.seen {
+                    self.seen = msg.update_id + 1;
+                }
+                if let Some(role) = self.classify_role(&msg, own_id) {
+                    return Ok(Some(role));
+                }
+            }
+        }
+    }
+
+    /// If this message is a *fresh* `PTUN ROLE <client|server>` line from the
+    /// peer bot, return the declared role. Own-bot echoes, other senders,
+    /// non-bots, malformed tokens and stale lines are ignored (same loop-
+    /// prevention and staleness policy as the READY and address lines).
+    fn classify_role(&self, msg: &UpdateMessage, own_id: i64) -> Option<Role> {
+        let text = msg.message.text.as_deref()?;
+        let body = text.trim().strip_prefix(ROLE_PREFIX)?;
+        let role = Role::parse(body)?;
+        let from = msg.message.from.as_ref()?;
+        if from.id == own_id || !from.is_bot {
+            return None;
+        }
+        if from.id != self.peer_bot_id {
+            warn!(
+                sender = from.id,
+                "ignoring PTUN ROLE message from unexpected sender"
+            );
+            return None;
+        }
+        // Staleness: a ROLE line from a previous run of the peer is not a
+        // declaration for *this* run. A missing date (0, synthetic test
+        // messages) is accepted, like everywhere else.
+        if msg.message.date > 0 {
+            let age = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+                - msg.message.date;
+            if age > MAX_READY_AGE_SECS {
+                warn!(
+                    age_secs = age,
+                    "ignoring stale PTUN ROLE line (older than {MAX_READY_AGE_SECS}s)"
+                );
+                return None;
+            }
+        }
+        Some(role)
     }
 
     /// If this message is a *fresh* `PTUN READY <secret>` line from the peer
@@ -491,8 +664,8 @@ impl Telegram {
         }
     }
 
-    async fn fetch_updates(&self) -> Result<Vec<UpdateMessage>, TelegramError> {
-        let timeout = GET_UPDATES_TIMEOUT_SECS.to_string();
+    async fn fetch_updates(&self, timeout_secs: u64) -> Result<Vec<UpdateMessage>, TelegramError> {
+        let timeout = timeout_secs.to_string();
         let offset_s = self.seen.to_string();
         // `result` of `getUpdates` is the array itself, so `T` is the vec.
         self.call_with::<Vec<UpdateMessage>>(
@@ -798,5 +971,108 @@ mod tests {
             .as_secs() as i64;
         let m = msg_at(9001, true, "PTUN READY my-secret", now - 5);
         assert!(tg.classify_ready(&m, 1001, "my-secret"));
+    }
+
+    // ---- PTUN ROLE (v1.1) --------------------------------------------------
+
+    #[test]
+    fn role_line_is_well_formed() {
+        assert_eq!(format!("{ROLE_PREFIX}{}", Role::Client), "PTUN ROLE client");
+        assert_eq!(format!("{ROLE_PREFIX}{}", Role::Server), "PTUN ROLE server");
+    }
+
+    #[test]
+    fn classify_role_accepts_peer_line() {
+        let tg = tg_for_test(9001);
+        let own_id = 1001;
+        assert_eq!(
+            tg.classify_role(&msg(9001, true, "PTUN ROLE client"), own_id),
+            Some(Role::Client)
+        );
+        assert_eq!(
+            tg.classify_role(&msg(9001, true, "PTUN ROLE server"), own_id),
+            Some(Role::Server)
+        );
+        // Case-insensitive, like setup input.
+        assert_eq!(
+            tg.classify_role(&msg(9001, true, "PTUN ROLE Server"), own_id),
+            Some(Role::Server)
+        );
+    }
+
+    #[test]
+    fn classify_role_ignores_own_echo() {
+        let tg = tg_for_test(9001);
+        let m = msg(1001, true, "PTUN ROLE client");
+        assert_eq!(tg.classify_role(&m, 1001), None);
+    }
+
+    #[test]
+    fn classify_role_ignores_unexpected_sender_and_non_bot() {
+        let tg = tg_for_test(9001);
+        assert_eq!(
+            tg.classify_role(&msg(7777, true, "PTUN ROLE client"), 1001),
+            None
+        );
+        assert_eq!(
+            tg.classify_role(&msg(9001, false, "PTUN ROLE client"), 1001),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_role_rejects_garbage() {
+        let tg = tg_for_test(9001);
+        let own_id = 1001;
+        assert_eq!(
+            tg.classify_role(&msg(9001, true, "PTUN ROLE banana"), own_id),
+            None
+        );
+        assert_eq!(
+            tg.classify_role(&msg(9001, true, "PTUN ROLE"), own_id),
+            None
+        );
+        assert_eq!(
+            tg.classify_role(&msg(9001, true, "PTUN ROLE  "), own_id),
+            None
+        );
+        assert_eq!(
+            tg.classify_role(&msg(9001, true, "PTUN v1 1.2.3.4:5"), own_id),
+            None
+        );
+        assert_eq!(
+            tg.classify_role(&msg(9001, true, "PTUN READY my-secret"), own_id),
+            None
+        );
+        assert_eq!(tg.classify_role(&msg(9001, true, "hello"), own_id), None);
+    }
+
+    #[test]
+    fn classify_role_accepts_fresh_and_dateless_line() {
+        let tg = tg_for_test(9001);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(
+            tg.classify_role(&msg_at(9001, true, "PTUN ROLE client", now - 5), 1001),
+            Some(Role::Client)
+        );
+        // date 0 (synthetic) is accepted rather than deadlocking the exchange.
+        assert_eq!(
+            tg.classify_role(&msg_at(9001, true, "PTUN ROLE client", 0), 1001),
+            Some(Role::Client)
+        );
+    }
+
+    #[test]
+    fn classify_role_rejects_stale_line() {
+        let tg = tg_for_test(9001);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let m = msg_at(9001, true, "PTUN ROLE client", now - 3600);
+        assert_eq!(tg.classify_role(&m, 1001), None);
     }
 }

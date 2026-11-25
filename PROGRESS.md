@@ -268,17 +268,112 @@ waits for the peer's.
   the NAT is stricter on. `keep_alive_interval` must stay below the QUIC
   idle timeout of both peers (default 30 s) — 5 s is well under.
 
+## v2 — Reconnect supervisor + startup setup (2026-11-25) ✅ (Phase 4 done)
+
+The v2 orchestration layer (plan.md, seeded from the frozen Rust oracle):
+the app is a **reconnect supervisor**, not a one-shot pipeline. Startup
+selects the role + channel (interactive setup), then loops: exchange → STUN →
+(Telegram) role cross-check → punch → QUIC → tunnel; on tunnel loss the
+supervisor backs off and re-negotiates everything.
+
+**New modules:**
+- `src/setup.rs` (~530 lines, 20 tests): startup resolution order CLI flag >
+  config file > interactive prompt for the role; same for `local_tcp_listen_port`
+  (client) / `remote_target_addr` (server) and the channel. Role conflict at
+  reload/force-select re-asks (`SetupBail::{Aborted, Fatal}`). Exported through
+  `src/lib.rs`.
+- `src/supervisor.rs` (~870 lines): the re-negotiation loop. `run()` does setup,
+  then per attempt: stable-reset (tunnel up ≥ 30 s → backoff clock resets) →
+  `attempt += 1` → (manual mode) reuse cached peer addr unless the punch-fail
+  streak ≥ 2 (previous value is shown as re-prompt hint) → fresh UDP bind →
+  resolve addresses (manual or Telegram) → emit PeerAddr → Telegram-only role
+  cross-check → punch → cert+fingerprint → keep-alive → QUIC (Server: accept;
+  Client: connect) → tunnel with a `tokio::select!` on `wait_aborted`. Exits
+  cleanly on user abort (q/Esc/Ctrl-C), fatal setup errors (non-zero exit),
+  structural tunnel errors (e.g. local TCP port in use), and forces a fresh
+  setup re-selection on a role conflict (the stale selection never survives).
+  `Retry` outcomes emit a warn log + `eprintln!` in non-TUI mode; `Renegotiating`
+  banner with the delay; manual mode caches the accepted peer address.
+- `src/main.rs`: thin driver — TUI auto-enable (`--tui`/`--no-tui` override),
+  tracing `off` when TUI on, `TuiEvent::Done` on clean exit, exit-1 on error
+  (TUI paints red; non-TUI prints `error:` + `hint:`).
+- `src/cli.rs`: `Cli { config, verbose, telegram, manual, role, tui, no_tui }`
+  (`--manual` is `--no-telegram`); `PromptBail::{ModeToggled, Aborted, Eof}`;
+  `--tui`/`--no-tui` for the render-loop switch.
+- `src/tui.rs`: events `Phase{...}` / `Log` / `OwnAddr` / `PeerAddr` /
+  `Role` / `Fingerprint` / `LocalPort` / `Target` / `Ready` / `Done` /
+  `Error` / `Prompt{...}` / `TelegramChannel(bool)` / `RetryBegin{attempt}` /
+  `Renegotiating{msg}` / `SelectedRole{role}`; state machine in `tui_state`
+  (`reset_for_attempt` clears per-attempt fields, keeps role + channel);
+  render loop sets `aborted` on q/Esc/Ctrl-C (abort propagation); prompt
+  editor handles mode toggle (`t`) and q/Esc abort.
+
+**Punch race fix (`src/punch.rs`):** `tokio::select!` could pick the recv
+branch on a peer packet arriving at loop entry, returning "hole punched" with
+`sent = 0` and no packets actually sent — visible in fast reconnects on
+loopback (server-side logs showed `sent=0`, `elapsed_ms=0`). send the first
+punch packet *before* the loop (`sent = 1`), consume the first
+immediately-ready tick, then loop. Verified live (both sides punched with
+`sent ≥ 1`); a deterministic regression test isn't practical — the race is a
+select! branch-choice, not a state.
+
+**PeerAddr emission fix (`src/supervisor.rs`):** the bare supervisor never
+emitted `TuiEvent::PeerAddr`, so the TUI connection panel stayed `peer —` on
+both sides (the pre-v2 main.rs emitted it). Emitted right after
+resolve_addrs/aborted check in run_attempt (found via the TUI drill, not by
+the compiler).
+
+**Abort-aware backoff (`src/supervisor.rs`):** the backoff sleep was plain
+`tokio::time::sleep` — q/Ctrl-C during backoff exited only after the delay
+(up to 30 s). Now races the sleep with `wait_aborted` (100 ms poll, same
+helper the tunnel phase uses) — q exits immediately. Verified live (q during
+the retry banner → process exits in ~1 s, header paints CLOSED).
+
+**Phase 4 done-when — kill-the-tunnel drill on loopback (verified 2026-11-25):**
+- Non-TUI (`--no-tui`): fresh sessions srv/cli (fast configs, STUN stub on
+  127.0.0.1:12302) → both punch → QUIC → echo through client port 12346:
+  `dr i l l-1` round-trip ✓. Server killed → client kept retrying (fresh STUN
+  per attempt), re-prompting with hint (`press Enter to keep 127.0.0.1:37892`)
+  → new server → client recovered → echo `dr i l l-2-after-restart` ✓.
+- TUI (`--tui` under tmux, 100×36, TERM=xterm-256color): server/client
+  CONNECTED; peer addr shown in both panels (post-fix); server killed →
+  client shows attempt badge (`attempt 3`) + re-prompt hint + `working on`
+  footer → new server → recovered → echo `tui-drill-2-after-restart` ✓.
+- Shutdown paths (all verified live): q in the tunnel (terminal restored,
+  CLOSED header, process exits) ✓; q in the prompt editor (terminal restored,
+  clean exit) ✓; q during the backoff sleep (~1 s, header CLOSED) ✓;
+  Ctrl-C in the TUI (clean exit) ✓; non-TUI Ctrl-C = default OS kill (no
+  signal handler in `src/` — documented) ✓.
+- STUN discovery is NOT reachable from this machine (both public servers time
+  out) — local loopback stub substitutes; no wire-level change. Ping-based
+  STUN check is a pre-existing Tier-2 known issue.
+
+**Verified:** `cargo test` = 94 lib + 1 telegram_exchange + 3 tui_prompt =
+**98 tests, 0 failed**; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo fmt --check` clean; `cargo build` clean.
+
 ## Current API surface
-- `config::Config{...}`, `Config::load(&Path)`
-- `cli::Cli{config, verbose}`, `Cli::parse()`, `cli::prompt_peer_addr()`, `cli::parse_peer_addr(&str)`
+- `config::Config{...}`, `Config::load(&Path)` — `role` optional; values validated at load.
+- `cli::Cli{config, verbose, telegram, manual, role, tui, no_tui}`, `Cli::parse()`
+- `setup::{setup, setup_force_select_with, resolve_role, resolve_setting, Setting, Setup, SetupBail}`
+- `supervisor::{run, retry_delay, AttemptOutcome, AttemptReport, STABLE_SECS, BASE_BACKOFF_SECS, MAX_BACKOFF_SECS}`
 - `stun::{encode_binding_request, parse_binding_response, discover_public_addr, StunError, STUN_MAGIC_COOKIE}`
-- `punch::punch(&UdpSocket, SocketAddr, &Config)`
-- `role::{Role, determine_role}`
+- `punch::punch(&UdpSocket, SocketAddr, &Config)` — first punch sent before the loop
+- `role::{Role, determine_role, check_compatible, RoleConflict}`
 - `quic::{CERT_CN, generate_self_signed_cert, fingerprint, build_client_config, build_server_config,
   transport_config_with_keep_alive, create_endpoint, connect, accept}`
-- `tunnel::{run_client_side, run_server_side, bridge_halves}` — all phases 8–10 wired in main.
+- `tunnel::{run_client_side, run_server_side, bridge_halves}` — all phases 8–10 wired via the supervisor.
+- `telegram::{Telegram, TelegramConfig, TelegramError, handshake, handshake_with_role, wait_role_grace}`
+- `tui::{TuiHandle, TuiEvent, PromptOutcome, LogLevel, PromptMode}` + `tui_state::{TuiState, Phase, PhaseStatus, ExchangeMode}`
 
 ## Next: Phase 12 — real two-machine NAT test (first real QUIC handshake validation)
+
+> **Note (2026-11-25):** the v2 reconnect supervisor + Phase 4 drill are
+> done; the NAT/two-machine test remains the one outstanding real-world gate.
+> The Phase 5 setup screen (plan.md: dedicated TUI S1 with role picker, field
+> cycling, channel toggle) is ALSO not implemented — startup setup currently
+> runs via the first-phase prompt editor (same `t` toggle, same abort keys,
+> no dedicated screen). Tracked as follow-up.
 1. Machine A (e.g. this box): server config (`remote_target_addr` = a private
    service, e.g. `127.0.0.1:2222` running a local `ssh -p 2222` listener or a
    test TCP echo server).

@@ -78,6 +78,14 @@ pub enum TuiEvent {
     /// A working Telegram channel exists (or not) — the render loop shows or
     /// hides the `[t]` mode-toggle hint accordingly.
     TelegramChannel(bool),
+    /// The supervisor started a new attempt: per-attempt state is reset and
+    /// the event log records it (logs survive across attempts).
+    RetryBegin { attempt: u32 },
+    /// The tunnel dropped and the supervisor is waiting before the next
+    /// attempt — the footer shows this until [`TuiEvent::RetryBegin`].
+    Renegotiating(String),
+    /// The user-selected role from startup setup (shown in the header/diagram).
+    SelectedRole(String),
 }
 
 /// The outcome of an interactive prompt, sent back to the pipeline.
@@ -275,6 +283,27 @@ pub fn apply_event(state: &mut TuiState, ev: TuiEvent) {
             state.done = true;
             state.error = true;
             state.push_log(LogLevel::Error, msg);
+        }
+        TuiEvent::RetryBegin { attempt } => {
+            state.reset_for_attempt(attempt);
+            // The operator's role selection survives the reset — keep the
+            // role line and the Role phase stepper lit.
+            if state.selected_role.is_some() {
+                state.set_phase(Phase::Role, PhaseStatus::Done);
+            }
+            state.push_log(
+                LogLevel::Info,
+                format!("attempt {attempt} — re-negotiating"),
+            );
+        }
+        TuiEvent::Renegotiating(msg) => {
+            state.renegotiating = true;
+            state.renegotiating_msg = Some(msg.clone());
+            state.push_log(LogLevel::Warn, msg);
+        }
+        TuiEvent::SelectedRole(r) => {
+            state.push_log(LogLevel::Info, format!("role selected: {r}"));
+            state.selected_role = Some(r);
         }
         TuiEvent::TelegramChannel(available) => {
             state.telegram_available = available;
@@ -525,20 +554,32 @@ fn draw_prompt_line(f: &mut Frame, area: Rect, state: &TuiState) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, state: &TuiState) {
+    let attempt = state
+        .attempt
+        .filter(|&n| n >= 2)
+        .map(|n| format!(" · attempt {n}"))
+        .unwrap_or_default();
     let title = match (state.done, state.error) {
         (true, true) => Line::from(Span::styled(
-            " p2p-tunnel  —  ERROR ",
+            format!(" p2p-tunnel{attempt}  —  ERROR "),
             Style::default().red().bold(),
         )),
         (true, false) => Line::from(Span::styled(
-            " p2p-tunnel  —  CLOSED ",
+            format!(" p2p-tunnel{attempt}  —  CLOSED "),
             Style::default().green().bold(),
         )),
         _ if state.ready => Line::from(Span::styled(
-            " p2p-tunnel  —  CONNECTED ",
+            format!(" p2p-tunnel{attempt}  —  CONNECTED "),
             Style::default().cyan().bold(),
         )),
-        _ => Line::from(Span::styled(" p2p-tunnel ", Style::default().cyan().bold())),
+        _ if state.renegotiating => Line::from(Span::styled(
+            format!(" p2p-tunnel{attempt}  —  WAITING "),
+            Style::default().yellow().bold(),
+        )),
+        _ => Line::from(Span::styled(
+            format!(" p2p-tunnel{attempt} "),
+            Style::default().cyan().bold(),
+        )),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -617,7 +658,11 @@ fn draw_diagram(f: &mut Frame, area: Rect, state: &TuiState) {
         Line::from(vec![
             Span::styled(" role ", Style::default().dim()),
             Span::styled(
-                state.role.clone().unwrap_or_else(|| "—".into()),
+                state
+                    .selected_role
+                    .clone()
+                    .or_else(|| state.role.clone())
+                    .unwrap_or_else(|| "—".into()),
                 Style::default().bold(),
             ),
         ]),
@@ -664,7 +709,12 @@ fn draw_log(f: &mut Frame, area: Rect, state: &TuiState) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, state: &TuiState) {
-    let left = if state.done {
+    let left = if state.renegotiating {
+        format!(
+            " re-negotiating — {} ",
+            state.renegotiating_msg.as_deref().unwrap_or("tunnel down")
+        )
+    } else if state.done {
         String::from(" session ended ")
     } else if state.ready {
         String::from(" CONNECTED — traffic flowing ")
@@ -677,7 +727,9 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &TuiState) {
     } else {
         format!(" working on: {} ", phase_label(state.active_phase()))
     };
-    let right = if state.done {
+    let right = if state.renegotiating {
+        String::from(" q to quit ")
+    } else if state.done {
         String::from(" q to close ")
     } else if state.ready {
         String::from(" q to tear down ")

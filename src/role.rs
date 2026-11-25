@@ -5,6 +5,7 @@
 //! exactly one side becomes the QUIC server and the other the client — no
 //! handshake needed.
 
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
 /// Which side of the QUIC connection we play.
@@ -22,6 +23,66 @@ impl Role {
             Role::Server => "server",
             Role::Client => "client",
         }
+    }
+
+    /// The role the peer must run. The two sides must be opposite — a
+    /// tunnel needs exactly one server and one client.
+    pub fn opposite(self) -> Role {
+        match self {
+            Role::Server => Role::Client,
+            Role::Client => Role::Server,
+        }
+    }
+
+    /// Parse a role from its wire/setup form: `client`/`server`
+    /// (case-insensitive, surrounding whitespace tolerated). Used for
+    /// `PTUN ROLE` lines and setup input.
+    pub fn parse(s: &str) -> Option<Role> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "client" => Some(Role::Client),
+            "server" => Some(Role::Server),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Both sides selected the same role — no tunnel can be formed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleConflict {
+    pub ours: Role,
+    pub theirs: Role,
+}
+
+impl fmt::Display for RoleConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A conflict can only be constructed when both sides match, so `ours`
+        // names the shared (wrong) selection on both ends.
+        write!(
+            f,
+            "role misconfiguration: both sides selected '{}' — the two sides \
+             must be one client and one server",
+            self.ours
+        )
+    }
+}
+
+/// Cross-check the user-selected roles of the two sides.
+///
+/// Opposite roles are compatible (a tunnel can be formed); identical roles
+/// are a misconfiguration and must be reported to the operator, who
+/// re-selects at the setup screen. The legacy IP-order derivation is *not*
+/// applied here — an explicit selection always wins.
+pub fn check_compatible(ours: Role, theirs: Role) -> Result<(), RoleConflict> {
+    if ours == theirs {
+        Err(RoleConflict { ours, theirs })
+    } else {
+        Ok(())
     }
 }
 
@@ -64,6 +125,42 @@ pub fn determine_role(own: SocketAddr, peer: SocketAddr) -> Role {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- conflict detection (v2) --------------------------------------------
+
+    #[test]
+    fn conflict_matrix() {
+        // Same role on both sides → conflict.
+        for r in [Role::Client, Role::Server] {
+            let err = check_compatible(r, r).unwrap_err();
+            assert_eq!(err, RoleConflict { ours: r, theirs: r });
+            assert!(
+                err.to_string().contains("role misconfiguration"),
+                "message must carry the hint-able prefix, got: {err}"
+            );
+        }
+        // Opposite roles → OK (in either order).
+        assert!(check_compatible(Role::Client, Role::Server).is_ok());
+        assert!(check_compatible(Role::Server, Role::Client).is_ok());
+    }
+
+    #[test]
+    fn role_parse_and_display() {
+        assert_eq!(Role::parse("client"), Some(Role::Client));
+        assert_eq!(Role::parse("SERVER"), Some(Role::Server));
+        assert_eq!(Role::parse("  client  "), Some(Role::Client));
+        assert_eq!(Role::parse("banana"), None);
+        assert_eq!(Role::parse(""), None);
+        assert_eq!(Role::Client.to_string(), "client");
+        assert_eq!(Role::Server.to_string(), "server");
+    }
+
+    #[test]
+    fn opposite_is_symmetric() {
+        assert_eq!(Role::Client.opposite(), Role::Server);
+        assert_eq!(Role::Server.opposite(), Role::Client);
+        assert_eq!(Role::Client.opposite().opposite(), Role::Client);
+    }
 
     #[test]
     fn v4_lower_is_server() {

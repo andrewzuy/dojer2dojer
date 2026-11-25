@@ -35,15 +35,30 @@ pub async fn punch(socket: &UdpSocket, peer_addr: SocketAddr, cfg: &Config) -> a
     );
 
     let start = tokio::time::Instant::now();
+
+    // Send the first punch packet immediately, before racing it against the
+    // inbound-packet branch. `select!` picks a ready branch randomly, so the
+    // first inbound packet racing the first tick could otherwise win and
+    // return "hole punched" without ever sending — a party that punches
+    // first would then be unanswered and time out.
+    socket
+        .send_to(&nonce, peer_addr)
+        .await
+        .context("sending punch packet")?;
+    let mut sent = 1u64;
+
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut buf = [0u8; 1024];
-    let mut sent = 0u64;
+
+    // Consume the first (immediately-ready) tick — the first punch packet
+    // was already sent above.
+    tick.tick().await;
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                // First tick completes immediately → first punch goes out at once.
+                // Subsequent ticks → punch again at the interval.
                 socket
                     .send_to(&nonce, peer_addr)
                     .await
@@ -102,6 +117,7 @@ mod tests {
             keep_alive_interval_secs: 5,
             local_tcp_listen_port: None,
             remote_target_addr: None,
+            role: None,
             telegram: None,
         }
     }

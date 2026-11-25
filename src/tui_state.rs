@@ -90,6 +90,17 @@ pub struct TuiState {
     /// `Some((prompt text, input so far))` while an interactive prompt is
     /// active; the input line is rendered at the bottom of the screen.
     pub prompt: Option<(String, String)>,
+    /// The user-selected role from startup setup (what the operator told us to
+    /// do), shown in the header alongside the IP-derived negotiated role.
+    pub selected_role: Option<String>,
+    /// The current supervisor attempt number (1-based), or `None` before the
+    /// first attempt begins.
+    pub attempt: Option<u32>,
+    /// True while the tunnel is down and the supervisor is waiting before the
+    /// next attempt (the operator sees this in the footer).
+    pub renegotiating: bool,
+    /// The most recent re-negotiation reason (shown in the footer).
+    pub renegotiating_msg: Option<String>,
 }
 
 /// How many log lines to keep in memory.
@@ -132,6 +143,26 @@ impl TuiState {
             .copied()
             .find(|p| self.status(*p) == PhaseStatus::Pending)
             .unwrap_or(Phase::Tunnel)
+    }
+
+    /// Reset the per-attempt fields for a new supervisor attempt. Logs, the
+    /// selected role, the Telegram availability flag and the exchange mode
+    /// survive across attempts (they belong to the app, not the attempt).
+    pub fn reset_for_attempt(&mut self, attempt: u32) {
+        self.phase_status.clear();
+        self.own_addr = None;
+        self.peer_addr = None;
+        self.role = None;
+        self.fingerprint = None;
+        self.local_port = None;
+        self.target = None;
+        self.ready = false;
+        self.done = false;
+        self.error = false;
+        self.prompt = None;
+        self.attempt = Some(attempt);
+        self.renegotiating = false;
+        self.renegotiating_msg = None;
     }
 
     pub fn push_log(&mut self, level: LogLevel, msg: String) {
@@ -193,6 +224,34 @@ mod tests {
         assert_eq!(ExchangeMode::from_bits(0), ExchangeMode::Manual);
         assert_eq!(ExchangeMode::from_bits(1), ExchangeMode::Telegram);
         assert_eq!(ExchangeMode::from_bits(99), ExchangeMode::Manual);
+    }
+
+    #[test]
+    fn reset_for_attempt_clears_per_attempt_fields() {
+        let mut s = TuiState {
+            own_addr: Some("1.2.3.4:5".into()),
+            peer_addr: Some("9.9.9.9:5".into()),
+            role: Some("client".into()),
+            fingerprint: Some("ff".into()),
+            ready: true,
+            done: true,
+            error: true,
+            selected_role: Some("server".into()),
+            renegotiating: true,
+            ..TuiState::default()
+        };
+        s.set_phase(Phase::Stun, PhaseStatus::Active);
+        s.push_log(LogLevel::Info, "kept".into());
+        s.reset_for_attempt(3);
+        assert_eq!(s.attempt, Some(3));
+        assert!(!s.renegotiating);
+        assert!(s.own_addr.is_none() && s.peer_addr.is_none() && s.role.is_none());
+        assert!(!s.ready && !s.done && !s.error);
+        assert_eq!(s.status(Phase::Stun), PhaseStatus::Pending);
+        // App-lifetime fields survive.
+        assert_eq!(s.selected_role.as_deref(), Some("server"));
+        assert_eq!(s.logs.len(), 1);
+        assert_eq!(s.logs[0].1, "kept");
     }
 
     #[test]

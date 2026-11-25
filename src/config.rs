@@ -1,3 +1,4 @@
+use crate::role::Role;
 use anyhow::Context;
 use serde::Deserialize;
 use std::path::Path;
@@ -22,6 +23,11 @@ pub struct Config {
     pub local_tcp_listen_port: Option<u16>,
     /// Where to forward incoming tunneled TCP (the "server side" of the tunnel).
     pub remote_target_addr: Option<String>,
+    /// This machine's role: `"client"` or `"server"` (v2). Optional: when
+    /// absent, the role is selected interactively at startup (the CLI
+    /// `--role` flag wins over this key).
+    #[serde(default)]
+    pub role: Option<String>,
     /// Optional Telegram bot-to-bot signaling (the `[telegram]` table).
     /// Presence alone does not activate it — the `--telegram` CLI flag does.
     #[serde(default)]
@@ -53,6 +59,21 @@ pub struct TelegramConfig {
     pub secret: Option<String>,
 }
 
+impl TelegramConfig {
+    /// True when the table is usable for the Telegram exchange: a token, a
+    /// peer bot id and the shared secret are all present. v2 defaults to
+    /// Telegram only for complete tables (see `cli::resolve_exchange_mode`).
+    pub fn is_complete(&self) -> bool {
+        !self.token.trim().is_empty()
+            && self.peer_bot_id > 0
+            && self
+                .secret
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty())
+    }
+}
+
 fn default_telegram_timeout_secs() -> u64 {
     120
 }
@@ -79,13 +100,161 @@ impl Config {
         if cfg.stun_servers.is_empty() {
             anyhow::bail!("config: `stun_servers` must contain at least one server");
         }
+        if let Some(r) = &cfg.role {
+            Role::parse(r).ok_or_else(|| {
+                anyhow::anyhow!("config: `role` must be \"client\" or \"server\" (got {r:?})")
+            })?;
+        }
         Ok(cfg)
+    }
+
+    /// The role declared in the config, if any (validated at load time).
+    pub fn declared_role(&self) -> Option<Role> {
+        self.role.as_deref().and_then(Role::parse)
+    }
+
+    /// Role-aware validation (v2): once the role is known, the role-specific
+    /// key must be present (and valid). Called after role selection — from
+    /// the CLI flag, the config, or the interactive setup prompt.
+    pub fn validate_for_role(&self, role: Role) -> anyhow::Result<()> {
+        match role {
+            Role::Client => {
+                self.local_tcp_listen_port.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "config: `local_tcp_listen_port` is required for the client role \n                     \
+                         (the local TCP port to expose through the tunnel)"
+                    )
+                })?;
+            }
+            Role::Server => {
+                let target = self.remote_target_addr.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "config: `remote_target_addr` is required for the server role \n                     \
+                         (the private ip:port to forward tunneled TCP to)"
+                    )
+                })?;
+                target.parse::<std::net::SocketAddr>().with_context(|| {
+                    format!("config: `remote_target_addr` = {target:?} is not a valid ip:port")
+                })?;
+            }
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal in-memory config builder for the pure validation tests.
+    fn cfg(role: Option<&str>, port: Option<u16>, target: Option<&str>) -> Config {
+        Config {
+            stun_servers: vec!["stun.l.google.com:19302".into()],
+            punch_interval_ms: 500,
+            punch_timeout_secs: 30,
+            keep_alive_interval_secs: 5,
+            local_tcp_listen_port: port,
+            remote_target_addr: target.map(str::to_string),
+            role: role.map(str::to_string),
+            telegram: None,
+        }
+    }
+
+    #[test]
+    fn validate_for_role_client() {
+        cfg(None, Some(12345), None)
+            .validate_for_role(Role::Client)
+            .unwrap();
+        let err = cfg(None, None, None)
+            .validate_for_role(Role::Client)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("local_tcp_listen_port"), "{msg}");
+        assert!(msg.contains("client role"), "{msg}");
+    }
+
+    #[test]
+    fn validate_for_role_server() {
+        cfg(None, None, Some("192.168.1.50:22"))
+            .validate_for_role(Role::Server)
+            .unwrap();
+        let err = cfg(None, None, None)
+            .validate_for_role(Role::Server)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("remote_target_addr"), "{msg}");
+        assert!(msg.contains("server role"), "{msg}");
+        let err = cfg(None, None, Some("not-an-addr"))
+            .validate_for_role(Role::Server)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a valid ip:port"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn declared_role_parses_and_rejects() {
+        assert_eq!(
+            cfg(Some("client"), None, None).declared_role(),
+            Some(Role::Client)
+        );
+        assert_eq!(
+            cfg(Some("Server"), None, None).declared_role(),
+            Some(Role::Server)
+        );
+        assert_eq!(
+            cfg(Some("  server "), None, None).declared_role(),
+            Some(Role::Server)
+        );
+        assert_eq!(cfg(None, None, None).declared_role(), None);
+        // Garbage is rejected at load time.
+        let dir = std::env::temp_dir();
+        let path = dir.join("p2p-tunnel-test-badrole.toml");
+        std::fs::write(&path, "stun_servers = [\"a:1\"]\nrole = \"banana\"\n").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("must be \"client\" or \"server\""));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn telegram_is_complete_matrix() {
+        let base = TelegramConfig {
+            token: "t".into(),
+            peer_bot_id: 9,
+            timeout_secs: 120,
+            secret: Some("s".into()),
+        };
+        assert!(base.is_complete());
+        assert!(
+            !TelegramConfig {
+                token: "  ".into(),
+                ..base.clone()
+            }
+            .is_complete()
+        );
+        assert!(
+            !TelegramConfig {
+                peer_bot_id: 0,
+                ..base.clone()
+            }
+            .is_complete()
+        );
+        assert!(
+            !TelegramConfig {
+                secret: None,
+                ..base.clone()
+            }
+            .is_complete()
+        );
+        assert!(
+            !TelegramConfig {
+                secret: Some("   ".into()),
+                ..base
+            }
+            .is_complete()
+        );
+    }
 
     #[test]
     fn loads_full_config() {
