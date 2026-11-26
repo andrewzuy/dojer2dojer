@@ -352,10 +352,50 @@ the retry banner → process exits in ~1 s, header paints CLOSED).
 **98 tests, 0 failed**; `cargo clippy --all-targets -- -D warnings` clean;
 `cargo fmt --check` clean; `cargo build` clean.
 
+## Phase 5 — Dedicated TUI setup screen (2026-11-25) ✅
+
+Startup now runs in a dedicated full-area setup screen (plan.md S1), instead of
+the first-phase inline prompt editor. The S1 form is a pure state machine
+(`tui_state::SetupForm::apply` + `submit`), testable without a terminal.
+
+**What changed:**
+- `src/tui_state.rs`: 7-phase stepper (`Setup, Stun, Exchange, Punch, RoleCheck,
+  Quic, Tunnel`), `SetupForm` (role picker + channel toggle + per-role setting
+  draft + inline error), `ValidatedSetup`, `FormKey`/`FormKeyOutcome`,
+  `setup_tui`-side helpers; `TuiState.setup_form: Option<SetupForm>`.
+- `src/setup.rs`: `validated_to_setup(ValidatedSetup) -> Setup`;
+  `SetupInitial::from_config` + `setup_form()`; `setup_tui(cfg, cli, ui,
+  force_select) -> Result<SetupOutcome, SetupBail>` (non-TUI falls through to
+  the plain stdin path unchanged).
+- `src/tui.rs`: S1 screen (`setup_screen`/`draw_setup_screen`/`form_key`) —
+  role picker (◀ CLIENT / SERVER ▶), per-role setting (local port / service
+  target), channel badge with [t] toggle, inline error line, hint bar;
+  full-area takeover while `state.setup_form` is `Some`; `TuiEvent::Setup` /
+  `PeerRole` / `PeerRole emission in run_attempt`; red `RE-NEGOTIATING
+  (attempt N)` header banner (attempt number is the UPCOMING attempt, passed
+  as the payload); connection panel gains the local-port/target line
+  (`port`/`serve` label); `TuiEvent::Role` removed.
+- `src/supervisor.rs`: both setup paths (initial + conflict re-ask) call
+  `setup_tui`; emits `Phase(Setup, Active)` before the screen; `PeerRole`
+  emitted after resolve_addrs (unconditional).
+- `src/main.rs`: unchanged — `Done`/error events already carry the 400 ms
+  final paint / 3 s error dwell (plan.md Phase 5).
+
+**Live drill (tmux, TERM=xterm-256color):** client path — Left → Tab → type
+port → Enter → pipeline proceeds (STUN done, EXCHANGE active; stepper shows
+SETUP ✓); empty-port Enter → inline `✗ enter a local TCP port` error;
+server path — `--role server` pre-fills the picker, Tab → type target →
+Enter → pipeline proceeds (roles server); q aborts the screen cleanly;
+q in the main loop quits with terminal restored; error path (empty port)
+verified; lifecycle/connection/events panels render the setup outcome.
+
+**Verified:** `cargo test` = 104 lib + 1 telegram_exchange + 3 tui_prompt =
+**108 tests, 0 failed**; clippy `-D warnings` clean; fmt clean; build clean.
+
 ## Current API surface
 - `config::Config{...}`, `Config::load(&Path)` — `role` optional; values validated at load.
 - `cli::Cli{config, verbose, telegram, manual, role, tui, no_tui}`, `Cli::parse()`
-- `setup::{setup, setup_force_select_with, resolve_role, resolve_setting, Setting, Setup, SetupBail}`
+- `setup::{setup, setup_force_select_with, setup_tui, validated_to_setup, resolve_role, resolve_setting, Setting, Setup, SetupBail, SetupInitial}` (`tui::SetupOutcome` — reusable answer type)
 - `supervisor::{run, retry_delay, AttemptOutcome, AttemptReport, STABLE_SECS, BASE_BACKOFF_SECS, MAX_BACKOFF_SECS}`
 - `stun::{encode_binding_request, parse_binding_response, discover_public_addr, StunError, STUN_MAGIC_COOKIE}`
 - `punch::punch(&UdpSocket, SocketAddr, &Config)` — first punch sent before the loop
@@ -364,16 +404,13 @@ the retry banner → process exits in ~1 s, header paints CLOSED).
   transport_config_with_keep_alive, create_endpoint, connect, accept}`
 - `tunnel::{run_client_side, run_server_side, bridge_halves}` — all phases 8–10 wired via the supervisor.
 - `telegram::{Telegram, TelegramConfig, TelegramError, handshake, handshake_with_role, wait_role_grace}`
-- `tui::{TuiHandle, TuiEvent, PromptOutcome, LogLevel, PromptMode}` + `tui_state::{TuiState, Phase, PhaseStatus, ExchangeMode}`
+- `tui::{TuiHandle, TuiEvent, SetupOutcome, PromptOutcome, LogLevel, PromptMode}` + `tui_state::{TuiState, Phase, PhaseStatus, ExchangeMode, SetupForm, ValidatedSetup, SetupField, FormKey, FormKeyOutcome}`
 
 ## Next: Phase 12 — real two-machine NAT test (first real QUIC handshake validation)
 
-> **Note (2026-11-25):** the v2 reconnect supervisor + Phase 4 drill are
-> done; the NAT/two-machine test remains the one outstanding real-world gate.
-> The Phase 5 setup screen (plan.md: dedicated TUI S1 with role picker, field
-> cycling, channel toggle) is ALSO not implemented — startup setup currently
-> runs via the first-phase prompt editor (same `t` toggle, same abort keys,
-> no dedicated screen). Tracked as follow-up.
+> **Note (2026-11-25):** v2 supervisor + Phase 4 drill + Phase 5 setup screen
+> are done; the NAT/two-machine test remains the one outstanding real-world
+> gate. Phase 6 (docs/logging polish) is the next tracked item.
 1. Machine A (e.g. this box): server config (`remote_target_addr` = a private
    service, e.g. `127.0.0.1:2222` running a local `ssh -p 2222` listener or a
    test TCP echo server).

@@ -42,10 +42,10 @@ use crate::config::Config;
 use crate::punch::punch;
 use crate::quic;
 use crate::role::{self, Role};
-use crate::setup::{self, Setting, Setup, SetupBail};
+use crate::setup::{self, Setting, Setup, SetupBail, validated_to_setup};
 use crate::stun::discover_public_addr;
 use crate::telegram::Telegram;
-use crate::tui::{self, PromptOutcome, TuiEvent, TuiHandle};
+use crate::tui::{self, PromptOutcome, SetupOutcome, TuiEvent, TuiHandle};
 use crate::tui_state::{ExchangeMode, Phase, PhaseStatus};
 use crate::tunnel::{run_client_side, run_server_side};
 
@@ -92,8 +92,10 @@ struct AttemptReport {
 /// The v2 startup-setup + supervisor loop.
 pub async fn run(cfg: &Config, cli: &Cli, ui: &TuiHandle) -> anyhow::Result<()> {
     // ── Startup setup (v2): role + setting + channel, before the loop. ──
-    let mut setup = match setup::setup(cfg, cli, ui) {
-        Ok(s) => s,
+    ui.emit(TuiEvent::Phase(Phase::Setup, PhaseStatus::Active));
+    let mut setup = match setup::setup_tui(cfg, cli, ui, false) {
+        Ok(SetupOutcome::Submit(vs)) => validated_to_setup(vs),
+        Ok(SetupOutcome::Abort) => return Ok(()),
         Err(SetupBail::Aborted) => return Ok(()),
         Err(SetupBail::Fatal(msg)) => return Err(anyhow::anyhow!(msg)),
     };
@@ -176,7 +178,13 @@ pub async fn run(cfg: &Config, cli: &Cli, ui: &TuiHandle) -> anyhow::Result<()> 
                         }
                         let delay = retry_delay(attempt, rand::random::<f64>());
                         let msg = format!("{reason} — retrying in ~{}s", delay.as_secs().max(1));
-                        ui.emit(TuiEvent::Renegotiating(msg.clone()));
+                        // The banner shows the UPCOMING attempt number — the
+                        // counter only increments at the top of the next loop
+                        // iteration, so it is still the failed one right now.
+                        ui.emit(TuiEvent::Renegotiating {
+                            attempt: attempt + 1,
+                            msg: msg.clone(),
+                        });
                         ui.emit(TuiEvent::Log(tui::LogLevel::Warn, msg.clone()));
                         if ui.is_disabled() {
                             // Non-TUI mode: keep the retry visible in plain text.
@@ -203,15 +211,14 @@ pub async fn run(cfg: &Config, cli: &Cli, ui: &TuiHandle) -> anyhow::Result<()> 
                         let msg = format!("{conflict} — re-select your role to continue");
                         ui.emit(TuiEvent::Log(tui::LogLevel::Error, msg.clone()));
                         eprintln!("{msg}");
-                        match setup::setup_force_select_with(cfg, cli, &mut |prompt| {
-                            ui.ask_line(prompt)
-                        }) {
-                            Ok(new_setup) => {
-                                setup = new_setup;
+                        ui.emit(TuiEvent::Phase(Phase::Setup, PhaseStatus::Active));
+                        match setup::setup_tui(cfg, cli, ui, true) {
+                            Ok(SetupOutcome::Submit(vs)) => {
+                                setup = validated_to_setup(vs);
                                 attempt = 0; // fresh attempt, no backoff
                                 emit_selected_role(ui, &setup);
                             }
-                            Err(SetupBail::Aborted) => return Ok(()),
+                            Ok(SetupOutcome::Abort) | Err(SetupBail::Aborted) => return Ok(()),
                             Err(SetupBail::Fatal(msg)) => return Err(anyhow::anyhow!(msg)),
                         }
                     }
@@ -225,7 +232,7 @@ pub async fn run(cfg: &Config, cli: &Cli, ui: &TuiHandle) -> anyhow::Result<()> 
 /// Emit the selected-role events once per setup into the TUI.
 fn emit_selected_role(ui: &TuiHandle, setup: &Setup) {
     ui.emit(TuiEvent::SelectedRole(setup.role.as_str().to_string()));
-    ui.emit(TuiEvent::Phase(Phase::Role, PhaseStatus::Done));
+    ui.emit(TuiEvent::Phase(Phase::Setup, PhaseStatus::Done));
 }
 
 /// The full re-negotiation for one attempt.
@@ -291,9 +298,13 @@ async fn run_attempt(
         });
     }
 
-    // 2b. Tell the TUI about the resolved peer address so the connection panel
+    // 2b. Tell the TUI about the resolved peer address (and the peer's
+    // declared role, when the exchange carried one) so the connection panel
     // shows it. Skipped on reuse (the same address was already shown).
     ui.emit(tui::TuiEvent::PeerAddr(peer_addr.to_string()));
+    if let Some(r) = peer_role {
+        ui.emit(TuiEvent::PeerRole(r.as_str().to_string()));
+    }
 
     // 3. Role cross-check (Telegram mode only — a legacy peer or a manual
     //    exchange carries no declared role, so no cross-check is possible).

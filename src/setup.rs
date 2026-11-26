@@ -18,8 +18,8 @@ use std::net::SocketAddr;
 use crate::cli;
 use crate::config::Config;
 use crate::role::Role;
-use crate::tui::{PromptOutcome, TuiHandle};
-use crate::tui_state::ExchangeMode;
+use crate::tui::{PromptOutcome, SetupOutcome, TuiHandle};
+use crate::tui_state::{ExchangeMode, SetupForm, ValidatedSetting, ValidatedSetup};
 
 /// The role-specific setting the run needs beyond the config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,70 @@ pub struct Setup {
     /// `[telegram]` table is complete).
     pub channel: ExchangeMode,
     pub setting: Setting,
+}
+
+/// The validated `Setup` wrapper for the S1 screen. The form's `submit` can
+/// only fail at validation time, so this conversion is infallible.
+pub fn validated_to_setup(vs: ValidatedSetup) -> Setup {
+    let setting = match vs.setting {
+        ValidatedSetting::Client(p) => Setting::Client(p),
+        ValidatedSetting::Server(a) => Setting::Server(a),
+    };
+    Setup {
+        role: vs.role,
+        channel: vs.channel,
+        setting,
+    }
+}
+
+/// The caller-known defaults for the S1 setup screen.
+///
+/// Built from the CLI flag + config before the screen opens. The screen
+/// pre-fills from them — the operator confirms every value every run — and
+/// never silently keeps them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetupInitial {
+    /// The role resolved from CLI/config (`--role` wins) — pre-filled.
+    pub role: Option<Role>,
+    /// The client-facing local TCP port (config value) — pre-filled.
+    pub port: Option<u16>,
+    /// The server-facing service (config value) — pre-filled.
+    pub target: Option<String>,
+    /// The address-exchange channel resolved from CLI/config.
+    pub channel: ExchangeMode,
+    /// Whether a working Telegram channel exists (arms the `t` toggle).
+    pub telegram_available: bool,
+}
+
+impl SetupInitial {
+    /// Build the pre-fill from CLI + config — the same priority the plain
+    /// path uses, so the S1 screen starts where the run would start.
+    pub fn from_config(cli: &cli::Cli, cfg: &Config) -> Self {
+        let channel = resolve_channel(cli, cfg).unwrap_or(ExchangeMode::Manual);
+        let role = cli
+            .role
+            .as_deref()
+            .and_then(Role::parse)
+            .or_else(|| cfg.declared_role());
+        Self {
+            role,
+            port: cfg.local_tcp_listen_port,
+            target: cfg.remote_target_addr.clone(),
+            channel,
+            telegram_available: channel == ExchangeMode::Telegram,
+        }
+    }
+
+    /// The form the S1 screen starts with.
+    pub fn setup_form(&self) -> SetupForm {
+        SetupForm::new(
+            self.role,
+            self.port,
+            self.target.as_deref(),
+            self.channel,
+            self.telegram_available,
+        )
+    }
 }
 
 /// The outcome of a setup prompt that terminated abnormally.
@@ -249,6 +313,57 @@ pub fn resolve_channel(cli: &cli::Cli, cfg: &Config) -> Result<ExchangeMode, Set
 /// error (misconfiguration / EOF with nothing configured) otherwise.
 pub fn setup(cfg: &Config, cli: &cli::Cli, ui: &TuiHandle) -> Result<Setup, SetupBail> {
     setup_with(cfg, cli, &mut |prompt| ui.ask_line(prompt))
+}
+
+/// Run setup through the S1 TUI screen. When the handle is disabled (no TUI),
+/// falls through to the plain stdin path — identical behavior to before.
+///
+/// `force_select`: the operator was just told the current selection is wrong
+/// (a role conflict) — the screen starts EMPTY (no role/setting pre-fill),
+/// because a stale selection must never silently survive the conflict.
+///
+/// Returns the `SetupOutcome`: `Submit` on a validated submission, or `Abort`
+/// when the operator quits (q / Esc / Ctrl-C).
+pub fn setup_tui(
+    cfg: &Config,
+    cli: &cli::Cli,
+    ui: &TuiHandle,
+    force_select: bool,
+) -> Result<SetupOutcome, SetupBail> {
+    if ui.is_disabled() {
+        // Plain path — the pre-TUI behavior, unchanged.
+        let outcome = if force_select {
+            setup_force_select_with(cfg, cli, &mut |p| ui.ask_line(p))
+        } else {
+            setup_with(cfg, cli, &mut |p| ui.ask_line(p))
+        };
+        return outcome.map(|s| {
+            SetupOutcome::Submit(ValidatedSetup {
+                role: s.role,
+                channel: s.channel,
+                setting: match s.setting {
+                    Setting::Client(p) => ValidatedSetting::Client(p),
+                    Setting::Server(a) => ValidatedSetting::Server(a),
+                },
+            })
+        });
+    }
+
+    let mut initial = SetupInitial::from_config(cli, cfg);
+    if force_select {
+        initial.role = None;
+        initial.port = None;
+        initial.target = None;
+    }
+    let form = initial.setup_form();
+    match ui.ask_setup(form) {
+        Some(outcome) => Ok(outcome),
+        None => Err(SetupBail::Fatal(
+            "setup screen was closed without a validated answer — press q to abort cleanly, \
+             or pass --role <client|server> and a setting in the config"
+                .to_string(),
+        )),
+    }
 }
 
 /// Force a fresh re-selection (used after a role conflict): the role and the

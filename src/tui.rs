@@ -20,6 +20,14 @@
 //! replies with a [`PromptOutcome`]: the submitted line, a mode toggle (the
 //! `t` key switches manual ⇄ Telegram), or an abort (`q`/Esc/Ctrl-C).
 //!
+//! **The S1 setup screen.** Startup setup is a real screen, not a prompt: the
+//! pipeline emits [`TuiEvent::Setup`] carrying the [`SetupForm`], the render
+//! loop switches to a dedicated screen (role picker → setting field → channel
+//! badge), runs its own key loop, and replies with [`SetupOutcome`] — a
+//! validated [`ValidatedSetup`] or an abort. The screen re-renders on every
+//! keystroke; the pipeline is blocked on the reply, which is fine — no
+//! network I/O happens while the operator is setting things up.
+//!
 //! **Keyboard.** Outside a prompt: `q`/Esc/Ctrl-C aborts the whole run (a
 //! shared flag tells the pipeline to stop), and `t` switches the
 //! address-exchange mode when a Telegram channel is configured.
@@ -39,7 +47,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use crate::tui_state::{ExchangeMode, Phase, PhaseStatus, TuiState};
+use crate::tui_state::{
+    ExchangeMode, FormKey, Phase, PhaseStatus, SetupField, TuiState, ValidatedSetup,
+};
 
 /// A single progress message the pipeline reports to the TUI.
 ///
@@ -54,8 +64,6 @@ pub enum TuiEvent {
     OwnAddr(String),
     /// The peer public address was resolved.
     PeerAddr(String),
-    /// The negotiated role (server/client) is known.
-    Role(String),
     /// The certificate fingerprint, for out-of-band comparison.
     Fingerprint(String),
     /// The local listen port (client role) the user should connect to.
@@ -75,6 +83,15 @@ pub enum TuiEvent {
         prompt: String,
         reply_tx: mpsc::Sender<PromptOutcome>,
     },
+    /// The pipeline needs the operator to set up the run — the render loop
+    /// switches to the S1 setup screen and replies with the validated setup
+    /// (or an abort) on `reply_tx`.
+    Setup {
+        form: crate::tui_state::SetupForm,
+        reply_tx: mpsc::Sender<SetupOutcome>,
+    },
+    /// The peer declared its own role over the Telegram READY handshake.
+    PeerRole(String),
     /// A working Telegram channel exists (or not) — the render loop shows or
     /// hides the `[t]` mode-toggle hint accordingly.
     TelegramChannel(bool),
@@ -82,8 +99,10 @@ pub enum TuiEvent {
     /// the event log records it (logs survive across attempts).
     RetryBegin { attempt: u32 },
     /// The tunnel dropped and the supervisor is waiting before the next
-    /// attempt — the footer shows this until [`TuiEvent::RetryBegin`].
-    Renegotiating(String),
+    /// attempt — the header shows a red re-negotiating banner with this
+    /// (upcoming) attempt number, and the footer shows the message until
+    /// [`TuiEvent::RetryBegin`].
+    Renegotiating { attempt: u32, msg: String },
     /// The user-selected role from startup setup (shown in the header/diagram).
     SelectedRole(String),
 }
@@ -99,6 +118,15 @@ pub enum PromptOutcome {
     Aborted,
     /// stdin was closed (EOF; the non-TUI path only).
     Eof,
+}
+
+/// The outcome of the S1 setup screen, sent back to the pipeline.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SetupOutcome {
+    /// The operator validated and submitted the form.
+    Submit(ValidatedSetup),
+    /// The operator aborted the screen (`q` / Esc / Ctrl-C).
+    Abort,
 }
 
 /// Severity of a log line, mapping to a color in the UI.
@@ -184,6 +212,19 @@ impl TuiHandle {
         self.aborted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Ask the user for the startup setup (role + setting + channel) — the
+    /// S1 setup screen. The render loop takes over the terminal, runs the form
+    /// key loop, and replies with the outcome.
+    ///
+    /// Returns `None` when the TUI is disabled (callers fall back to the plain
+    /// stdin path) or when the render loop dropped the reply channel.
+    pub fn ask_setup(&self, form: crate::tui_state::SetupForm) -> Option<SetupOutcome> {
+        let tx = self.tx.as_ref()?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(TuiEvent::Setup { form, reply_tx }).ok()?;
+        reply_rx.recv().ok()
+    }
+
     /// Ask the user for a line of text and return the outcome.
     ///
     /// TUI active: hands the request to the render loop, which switches to
@@ -254,10 +295,6 @@ pub fn apply_event(state: &mut TuiState, ev: TuiEvent) {
             state.push_log(LogLevel::Info, format!("peer address: {a}"));
             state.peer_addr = Some(a);
         }
-        TuiEvent::Role(r) => {
-            state.push_log(LogLevel::Info, format!("role: {r}"));
-            state.role = Some(r);
-        }
         TuiEvent::Fingerprint(f) => {
             state.push_log(LogLevel::Info, format!("cert fingerprint: {f}"));
             state.fingerprint = Some(f);
@@ -287,18 +324,19 @@ pub fn apply_event(state: &mut TuiState, ev: TuiEvent) {
         TuiEvent::RetryBegin { attempt } => {
             state.reset_for_attempt(attempt);
             // The operator's role selection survives the reset — keep the
-            // role line and the Role phase stepper lit.
+            // selected-role line and the Setup phase stepper lit.
             if state.selected_role.is_some() {
-                state.set_phase(Phase::Role, PhaseStatus::Done);
+                state.set_phase(Phase::Setup, PhaseStatus::Done);
             }
             state.push_log(
                 LogLevel::Info,
                 format!("attempt {attempt} — re-negotiating"),
             );
         }
-        TuiEvent::Renegotiating(msg) => {
+        TuiEvent::Renegotiating { attempt, msg } => {
             state.renegotiating = true;
             state.renegotiating_msg = Some(msg.clone());
+            state.attempt = Some(attempt);
             state.push_log(LogLevel::Warn, msg);
         }
         TuiEvent::SelectedRole(r) => {
@@ -314,7 +352,12 @@ pub fn apply_event(state: &mut TuiState, ev: TuiEvent) {
                 );
             }
         }
+        TuiEvent::PeerRole(r) => {
+            state.push_log(LogLevel::Info, format!("peer declared role: {r}"));
+            state.peer_role = Some(r);
+        }
         TuiEvent::Prompt { .. } => {}
+        TuiEvent::Setup { .. } => {}
     }
 }
 
@@ -353,6 +396,14 @@ pub fn run_render_loop(
                     let outcome = prompt_editor(&mut terminal, &prompt, &mode, available);
                     let _ = reply_tx.send(outcome);
                     state = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+                }
+                TuiEvent::Setup { form, reply_tx } => {
+                    drop(state); // release the lock while we touch the terminal
+                    let outcome = setup_screen(&mut terminal, form, &mode);
+                    let _ = reply_tx.send(outcome);
+                    state = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+                    // The screen is closed — the main rendering resumes.
+                    state.setup_form = None;
                 }
                 other => apply_event(&mut state, other),
             }
@@ -511,6 +562,13 @@ fn draw(f: &mut Frame) {
         .unwrap_or_else(|p| p.into_inner())
         .clone();
     let area = f.area();
+
+    // The S1 setup screen is a full-area takeover while it is open.
+    if let Some(form) = state.setup_form.as_ref() {
+        draw_setup_screen(f, area, form, &state);
+        return;
+    }
+
     let prompt_active = state.prompt.is_some();
 
     // Four vertical regions: header, body (diagram + log), footer (the footer
@@ -531,6 +589,215 @@ fn draw(f: &mut Frame) {
     if prompt_active {
         draw_prompt_line(f, chunks[3], &state);
     }
+}
+
+// ── The S1 setup screen ──────────────────────────────────────────────────
+
+/// Map a raw crossterm key event down to the form's plain [`FormKey`].
+fn form_key(key: &crossterm::event::KeyEvent) -> FormKey {
+    use crossterm::event::KeyCode;
+    if ctrl_c(key) {
+        return FormKey::CtrlC;
+    }
+    match key.code {
+        KeyCode::Esc => FormKey::Esc,
+        KeyCode::Left => FormKey::Left,
+        KeyCode::Right => FormKey::Right,
+        KeyCode::Up => FormKey::Up,
+        KeyCode::Down => FormKey::Down,
+        KeyCode::Tab => FormKey::Tab,
+        KeyCode::Enter => FormKey::Enter,
+        KeyCode::Backspace => FormKey::Backspace,
+        KeyCode::Char(c) => FormKey::Char(c),
+        _ => FormKey::Unhandled,
+    }
+}
+
+/// The S1 setup screen's key loop. Blocks on keyboard input (like the prompt
+/// editor), redraws on every keystroke, and returns the outcome.
+fn setup_screen(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    mut form: crate::tui_state::SetupForm,
+    _mode: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+) -> SetupOutcome {
+    let outcome = loop {
+        // Reflect the form in the shared state so the main draw (and the
+        // footer) show it too.
+        {
+            let mut s = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+            s.setup_form = Some(form.clone());
+        }
+        if terminal.draw(draw).is_err() {
+            break SetupOutcome::Abort;
+        }
+        let key_event = match event::read() {
+            Ok(e) => e,
+            Err(_) => break SetupOutcome::Abort,
+        };
+        let Event::Key(key) = key_event else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match form.apply(form_key(&key)) {
+            crate::tui_state::FormKeyOutcome::Submit => match form.submit() {
+                Ok(validated) => break SetupOutcome::Submit(validated),
+                Err(err) => form.error = Some(err),
+            },
+            crate::tui_state::FormKeyOutcome::Abort => break SetupOutcome::Abort,
+            _ => {}
+        }
+    };
+    // Clear the form before the regular render resumes.
+    {
+        let mut s = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        s.setup_form = None;
+    }
+    outcome
+}
+
+/// Render the S1 setup screen. A focused, full-area screen — no stepper, no
+/// diagram — the operator's job is to confirm the two settings.
+fn draw_setup_screen(
+    f: &mut Frame,
+    area: Rect,
+    form: &crate::tui_state::SetupForm,
+    state: &TuiState,
+) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    // The role-conflict banner, if one is on the state.
+    if let Some(conflict) = state.role_conflict.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!(" ⚠ {conflict} "),
+            Style::default().yellow().bold(),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    // The question.
+    lines.push(Line::from(Span::styled(
+        " which side are you?",
+        Style::default().white().bold(),
+    )));
+    lines.push(Line::from(""));
+
+    // The role picker.
+    let role_focus = form.focused == SetupField::Role;
+    let role_style = |selected: bool| {
+        let mut s = if selected {
+            Style::default().cyan().bold()
+        } else {
+            Style::default().dim()
+        };
+        if role_focus {
+            s = s.add_modifier(ratatui::style::Modifier::UNDERLINED);
+        }
+        s
+    };
+    let client_sel = form.role == Some(crate::role::Role::Client);
+    let server_sel = form.role == Some(crate::role::Role::Server);
+    lines.push(Line::from(vec![
+        Span::styled("  ◀ CLIENT ", role_style(client_sel)),
+        Span::styled("    ", Style::default()),
+        Span::styled("SERVER ▶  ", role_style(server_sel)),
+        Span::styled(
+            format!(
+                "  (arrows, or {})",
+                if role_focus { "c / s" } else { "Tab to field" }
+            ),
+            Style::default().dim(),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    // The role-specific setting.
+    let setting_focus = form.focused == SetupField::Setting;
+    let setting_label = form.field_label();
+    lines.push(Line::from(vec![Span::styled(
+        format!("  {}", setting_label),
+        if form.role.is_some() {
+            if setting_focus {
+                Style::default().white().bold()
+            } else {
+                Style::default().dim()
+            }
+        } else {
+            Style::default().dim().italic()
+        },
+    )]));
+    lines.push(Line::from(""));
+
+    // The draft.
+    let draft = form.focused_draft();
+    let placeholder = form.draft_placeholder();
+    let mut draft_spans = vec![Span::styled("  ▊ ", Style::default().cyan())];
+    if draft.is_empty() && form.role.is_some() {
+        draft_spans.push(Span::styled(
+            placeholder.to_string(),
+            Style::default().dim().italic(),
+        ));
+    } else if draft.is_empty() {
+        draft_spans.push(Span::styled(
+            "pick a role first",
+            Style::default().dim().italic(),
+        ));
+    } else {
+        draft_spans.push(Span::raw(draft.to_string()));
+    }
+    lines.push(Line::from(draft_spans));
+    lines.push(Line::from(""));
+
+    // The channel badge.
+    let channel_badge = match form.channel {
+        ExchangeMode::Telegram => "telegram (default)",
+        ExchangeMode::Manual => "manual",
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  exchange  ", Style::default().dim()),
+        Span::styled(channel_badge.to_string(), Style::default().bold()),
+        if form.telegram_available {
+            Span::styled("  [t] toggle", Style::default().dim())
+        } else {
+            Span::raw("  (no Telegram channel)")
+        },
+    ]));
+    lines.push(Line::from(""));
+
+    // The error line (the form's validation message).
+    if let Some(err) = form.error.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {err}"),
+            Style::default().red().bold(),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    // The hint bar.
+    lines.push(Line::from(Span::styled(
+        "  ←/→ or c/s role · Tab next field · Enter submit · q/Esc abort",
+        Style::default().dark_gray().italic(),
+    )));
+
+    // Borders + padding included, so nothing is clipped.
+    let content_h = lines.len() + 4;
+    let height = content_h.min(area.height.saturating_sub(2) as usize).max(4);
+    let centered = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(height as u16),
+            Constraint::Fill(1),
+        ])
+        .split(area)[1];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style(state))
+        .title(" setup — this only runs once per run ")
+        .padding(ratatui::widgets::Padding::new(1, 0, 1, 1));
+    f.render_widget(Paragraph::new(lines).block(block), centered);
 }
 
 /// The prompt + live input line, drawn at the very bottom while a prompt is
@@ -572,10 +839,13 @@ fn draw_header(f: &mut Frame, area: Rect, state: &TuiState) {
             format!(" p2p-tunnel{attempt}  —  CONNECTED "),
             Style::default().cyan().bold(),
         )),
-        _ if state.renegotiating => Line::from(Span::styled(
-            format!(" p2p-tunnel{attempt}  —  WAITING "),
-            Style::default().yellow().bold(),
-        )),
+        _ if state.renegotiating => {
+            let n = state.attempt.unwrap_or(1);
+            Line::from(Span::styled(
+                format!(" p2p-tunnel  —  RE-NEGOTIATING (attempt {n}) "),
+                Style::default().red().bold(),
+            ))
+        }
         _ => Line::from(Span::styled(
             format!(" p2p-tunnel{attempt} "),
             Style::default().cyan().bold(),
@@ -593,7 +863,7 @@ fn draw_body(f: &mut Frame, area: Rect, state: &TuiState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6), // phase stepper
-            Constraint::Length(7), // connection diagram
+            Constraint::Length(8), // connection diagram
             Constraint::Min(3),    // event log
         ])
         .split(area);
@@ -605,10 +875,11 @@ fn draw_body(f: &mut Frame, area: Rect, state: &TuiState) {
 
 fn draw_phase_stepper(f: &mut Frame, area: Rect, state: &TuiState) {
     let phases = [
+        (Phase::Setup, "SETUP"),
         (Phase::Stun, "STUN"),
         (Phase::Exchange, "EXCHANGE"),
         (Phase::Punch, "PUNCH"),
-        (Phase::Role, "ROLE"),
+        (Phase::RoleCheck, "ROLE CHECK"),
         (Phase::Quic, "QUIC"),
         (Phase::Tunnel, "TUNNEL"),
     ];
@@ -623,6 +894,7 @@ fn draw_phase_stepper(f: &mut Frame, area: Rect, state: &TuiState) {
             }
             PhaseStatus::Pending => ("·", Style::default().dim()),
             PhaseStatus::Error => ("✗", Style::default().red()),
+            PhaseStatus::Skipped => ("—", Style::default().dim()),
         };
         if i > 0 {
             spans.push(Span::styled(" ── ", Style::default().dark_gray()));
@@ -656,15 +928,29 @@ fn draw_diagram(f: &mut Frame, area: Rect, state: &TuiState) {
             Span::raw(state.peer_addr.clone().unwrap_or_else(|| "—".into())),
         ]),
         Line::from(vec![
-            Span::styled(" role ", Style::default().dim()),
+            Span::styled("roles ", Style::default().dim()),
             Span::styled(
-                state
-                    .selected_role
-                    .clone()
-                    .or_else(|| state.role.clone())
-                    .unwrap_or_else(|| "—".into()),
-                Style::default().bold(),
+                state.selected_role.as_deref().unwrap_or("—"),
+                Style::default().cyan().bold(),
             ),
+            Span::raw(" · "),
+            Span::styled(
+                state.peer_role.as_deref().unwrap_or("—"),
+                Style::default().magenta().bold(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("via  ", Style::default().dim()),
+            Span::raw(state.exchange_mode.as_str()),
+            if state.telegram_available {
+                Span::styled("  [t]", Style::default().dim())
+            } else {
+                Span::raw("")
+            },
+        ]),
+        Line::from(vec![
+            Span::styled(port_label(state), Style::default().dim()),
+            Span::raw(port_value(state)),
         ]),
         Line::from(vec![
             Span::styled(" cert ", Style::default().dim()),
@@ -675,6 +961,26 @@ fn draw_diagram(f: &mut Frame, area: Rect, state: &TuiState) {
         ]),
     ];
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Label for the role-specific setting line: "port" for a client (the local
+/// TCP listener), "serve" for a server (the exposed service address).
+fn port_label(state: &TuiState) -> &'static str {
+    match state.selected_role.as_deref() {
+        Some("server") => " serve",
+        _ => " port ",
+    }
+}
+
+/// Value for the role-specific setting line.
+fn port_value(state: &TuiState) -> String {
+    match state.selected_role.as_deref() {
+        Some("server") => state.target.clone().unwrap_or_else(|| "—".into()),
+        _ => state
+            .local_port
+            .map(|p| format!("127.0.0.1:{p}"))
+            .unwrap_or_else(|| "—".into()),
+    }
 }
 
 fn draw_log(f: &mut Frame, area: Rect, state: &TuiState) {
@@ -761,10 +1067,11 @@ fn border_style(state: &TuiState) -> Style {
 
 fn phase_label(phase: Phase) -> &'static str {
     match phase {
+        Phase::Setup => "setup",
         Phase::Stun => "STUN discovery",
         Phase::Exchange => "address exchange",
         Phase::Punch => "hole punching",
-        Phase::Role => "role negotiation",
+        Phase::RoleCheck => "role cross-check",
         Phase::Quic => "QUIC handshake",
         Phase::Tunnel => "tunneling",
     }
@@ -797,4 +1104,24 @@ fn shorten(s: &str, max: usize) -> String {
         .get(s.len().saturating_sub(keep / 2).max(4)..)
         .unwrap_or("");
     format!("{head}…{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renegotiating_event_sets_upcoming_attempt_and_renegotiating() {
+        let mut s = TuiState::default();
+        apply_event(
+            &mut s,
+            TuiEvent::Renegotiating {
+                attempt: 3,
+                msg: "boom".into(),
+            },
+        );
+        assert!(s.renegotiating);
+        assert_eq!(s.renegotiating_msg.as_deref(), Some("boom"));
+        assert_eq!(s.attempt, Some(3));
+    }
 }
