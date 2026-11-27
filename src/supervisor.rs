@@ -229,8 +229,31 @@ pub async fn run(cfg: &Config, cli: &Cli, ui: &TuiHandle) -> anyhow::Result<()> 
     }
 }
 
-/// Emit the selected-role events once per setup into the TUI.
+/// Emit the selected-role events once per setup into the TUI, plus the
+/// plain-text counterpart for non-TUI runs.
 fn emit_selected_role(ui: &TuiHandle, setup: &Setup) {
+    let setting = match setup.setting {
+        Setting::Client(port) => format!("listen on 127.0.0.1:{port}"),
+        Setting::Server(addr) => format!("forward to {addr}"),
+    };
+    info!(
+        role = ?setup.role,
+        channel = ?setup.channel,
+        setting = %setting,
+        "role selected — setup complete"
+    );
+    // Show the configured setting in the connection panel right away (the
+    // tunnel stage emits the same event later).
+    match &setup.setting {
+        Setting::Client(port) => ui.emit(TuiEvent::Setting {
+            local_port: Some(*port),
+            target: None,
+        }),
+        Setting::Server(addr) => ui.emit(TuiEvent::Setting {
+            local_port: None,
+            target: Some(addr.to_string()),
+        }),
+    }
     ui.emit(TuiEvent::SelectedRole(setup.role.as_str().to_string()));
     ui.emit(TuiEvent::Phase(Phase::Setup, PhaseStatus::Done));
 }
@@ -308,14 +331,19 @@ async fn run_attempt(
 
     // 3. Role cross-check (Telegram mode only — a legacy peer or a manual
     //    exchange carries no declared role, so no cross-check is possible).
-    if let Some(peer_role) = peer_role
-        && role::check_compatible(setup.role, peer_role).is_err()
-    {
-        return Ok(AttemptReport {
-            outcome: AttemptOutcome::RoleConflict(peer_role),
-            tunnel_up_for: Duration::ZERO,
-            peer_addr: Some(peer_addr),
-        });
+    if let Some(peer_role) = peer_role {
+        if role::check_compatible(setup.role, peer_role).is_err() {
+            return Ok(AttemptReport {
+                outcome: AttemptOutcome::RoleConflict(peer_role),
+                tunnel_up_for: Duration::ZERO,
+                peer_addr: Some(peer_addr),
+            });
+        }
+        info!(
+            setup_role = ?setup.role,
+            peer_role = ?peer_role,
+            "role cross-check passed — roles are opposite as expected"
+        );
     }
 
     // 4. Hole punch. A punch failure is transient — the peer may be down or
@@ -364,7 +392,6 @@ async fn run_attempt(
     if matches!(setup.role, Role::Client) {
         endpoint.set_default_client_config(quic::build_client_config(keep_alive)?);
     }
-    info!(local = ?endpoint.local_addr(), "QUIC endpoint ready");
 
     // 7. Establish the connection.
     ui.emit(TuiEvent::Phase(Phase::Quic, PhaseStatus::Done));
@@ -409,6 +436,7 @@ async fn run_attempt(
         }
     };
     ui.emit(TuiEvent::Phase(Phase::Tunnel, PhaseStatus::Active));
+    info!("tunnel is up — traffic is flowing");
     ui.emit(TuiEvent::Ready);
 
     // 8. Tunnel — raced against the user's abort; the tunnel runs until the
@@ -531,6 +559,7 @@ async fn resolve_addrs_telegram(
     if telegram.is_none() {
         match Telegram::init(tg_cfg).await {
             Ok(t) => {
+                info!("exchanging readiness with the peer bot over Telegram…");
                 ui.emit(TuiEvent::Log(
                     tui::LogLevel::Info,
                     "exchanging readiness with the peer bot over Telegram…".into(),
@@ -579,6 +608,7 @@ async fn resolve_addrs_telegram(
             }
         }
     };
+    info!("peer bot confirmed it is up — discovering our address");
     ui.emit(TuiEvent::Log(
         tui::LogLevel::Info,
         "peer bot confirmed it is up — discovering our address".into(),
@@ -664,11 +694,15 @@ async fn resolve_addrs_manual(
         println!();
         println!("Your public address is: {public_addr}");
         println!("Give it to the other party, then enter their public address below.");
+        // Plain-text path: flush so the prompt is visible even when stdout is
+        // piped (block-buffered) rather than attached to a terminal.
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     ui.emit(TuiEvent::Phase(Phase::Exchange, PhaseStatus::Active));
 
     if let Some(reused) = reuse_addr {
+        info!(%reused, "reusing cached peer address");
         ui.emit(TuiEvent::Log(
             tui::LogLevel::Info,
             format!("reusing cached peer address {reused}"),

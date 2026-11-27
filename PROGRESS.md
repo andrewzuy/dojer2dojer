@@ -392,6 +392,46 @@ verified; lifecycle/connection/events panels render the setup outcome.
 **Verified:** `cargo test` = 104 lib + 1 telegram_exchange + 3 tui_prompt =
 **108 tests, 0 failed**; clippy `-D warnings` clean; fmt clean; build clean.
 
+## Phase 6 — Docs/logging polish (2026-11-25) ✅
+
+**Logging polish (non-TUI):**
+- `src/supervisor.rs` — `emit_selected_role` now logs a companion `info!` line
+  with the full setting ("role selected — setup complete — client, manual,
+  listen on 127.0.0.1:19001"), stage transitions log (STUN → PeerRole →
+  punch first-packet → QUIC ready → tunnel up "tunnel is up — traffic is
+  flowing"), readiness-exchange companion logged, peer-learned companion
+  logged, stale-cache reuse companion logged.
+- Non-TUI defect fix: the plain-text "Your public address" block was printed
+  with `println!` and never flushed (lost in pipes) — added stdout flush.
+
+**Docs:**
+- `README.md` rewritten for the v2 flow — setup-first pipeline (role + setting
+  + channel), Telegram-first signaling with READY/ROLE handshake, manual as
+  fallback, role cross-check (no longer address-derived), reconnect supervisor
+  (backoff 2s→30s with jitter, STABLE_SECS=30 reset), config table (role
+  key, telegram secret, client/server key scoping), CLI reference (--role,
+  --telegram default-on, --manual), security model, troubleshooting,
+  limitations, dev/tests/layout sections.
+- `config.toml` sample rewritten — role key documented, telegram secret
+  documented, client/server key comments corrected.
+
+**TUI polish (same pass):**
+- Connection panel port line shows the configured setting immediately at
+  setup time (new `TuiEvent::Setting` variant; tunnel-stage `LocalPort`/
+  `Target` events re-emit it with a log line — no double-log).
+- TUNNEL phase shows ✓ on Ready (was stuck on the spinner).
+- Port label now " serve " (server) with trailing space.
+
+**Verification (both paths):** non-TUI loopback drill — role selected → STUN
+→ hole punched (1 ms, 8-byte nonce) → QUIC endpoint ready → QUIC connection
+established vs the peer; echo check round-tripped through the tunnel
+(`b'hello-tunnel\n'`). TUI drill (tmux, 160x40, TERM=xterm-256color) —
+SETUP ✓ → lifecycle fully ✓ → header CONNECTED → connection panel shows
+both addrs/roles/cert; echo check green; Ctrl-C clean teardown.
+
+**Verified:** `cargo test` = 105 lib + 1 telegram_exchange + 3 tui_prompt =
+**109 tests, 0 failed**; clippy `-D warnings` clean; fmt clean; build clean.
+
 ## Current API surface
 - `config::Config{...}`, `Config::load(&Path)` — `role` optional; values validated at load.
 - `cli::Cli{config, verbose, telegram, manual, role, tui, no_tui}`, `Cli::parse()`
@@ -406,7 +446,9 @@ verified; lifecycle/connection/events panels render the setup outcome.
 - `telegram::{Telegram, TelegramConfig, TelegramError, handshake, handshake_with_role, wait_role_grace}`
 - `tui::{TuiHandle, TuiEvent, SetupOutcome, PromptOutcome, LogLevel, PromptMode}` + `tui_state::{TuiState, Phase, PhaseStatus, ExchangeMode, SetupForm, ValidatedSetup, SetupField, FormKey, FormKeyOutcome}`
 
-## Next: Phase 12 — real two-machine NAT test (first real QUIC handshake validation)
+## Next: Phase 12 — real two-machine NAT test
+(first real QUIC handshake validation; nat-sim helpers exist — driver +
+TESTING.md pending)
 
 > **Note (2026-11-25):** v2 supervisor + Phase 4 drill + Phase 5 setup screen
 > are done; the NAT/two-machine test remains the one outstanding real-world

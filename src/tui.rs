@@ -105,6 +105,12 @@ pub enum TuiEvent {
     Renegotiating { attempt: u32, msg: String },
     /// The user-selected role from startup setup (shown in the header/diagram).
     SelectedRole(String),
+    /// The configured setting, shown in the connection panel. Carries no log
+    /// line of its own — the tunnel stage re-emits the setting with a log.
+    Setting {
+        local_port: Option<u16>,
+        target: Option<String>,
+    },
 }
 
 /// The outcome of an interactive prompt, sent back to the pipeline.
@@ -307,8 +313,17 @@ pub fn apply_event(state: &mut TuiState, ev: TuiEvent) {
             state.push_log(LogLevel::Info, format!("forwarding to: {t}"));
             state.target = Some(t);
         }
+        TuiEvent::Setting { local_port, target } => {
+            if let Some(p) = local_port {
+                state.local_port = Some(p);
+            }
+            if let Some(t) = target {
+                state.target = Some(t);
+            }
+        }
         TuiEvent::Ready => {
             state.ready = true;
+            state.set_phase(Phase::Tunnel, PhaseStatus::Done);
             state.push_log(LogLevel::Info, "tunnel is up — traffic is flowing".into());
         }
         TuiEvent::Done(msg) => {
@@ -967,7 +982,7 @@ fn draw_diagram(f: &mut Frame, area: Rect, state: &TuiState) {
 /// TCP listener), "serve" for a server (the exposed service address).
 fn port_label(state: &TuiState) -> &'static str {
     match state.selected_role.as_deref() {
-        Some("server") => " serve",
+        Some("server") => " serve ",
         _ => " port ",
     }
 }

@@ -7,6 +7,12 @@ stun_servers = [
     "stun.cloudflare.com:3478",
 ]
 
+# This machine's role: "client" or "server". Optional — when absent, the role
+# is selected interactively at startup (the `--role` CLI flag wins over this
+# key). The two sides must disagree on nothing: both sides must pick opposite
+# roles for the same tunnel.
+# role = "client"
+
 # Milliseconds between outbound hole-punch packets.
 punch_interval_ms = 500
 
@@ -17,15 +23,16 @@ punch_timeout_secs = 30
 # idle so NAT port mappings don't expire and drop the connection. 0 = off.
 keep_alive_interval_secs = 5
 
-# Client side: local TCP port to listen on and forward through the tunnel.
+# Client role: local TCP port to listen on, forwarding through the tunnel.
 # Uncomment on the machine that exposes a local service port.
 # local_tcp_listen_port = 12345
 
-# Server side: where to forward incoming tunneled TCP traffic.
+# Server role: where to forward incoming tunneled TCP traffic.
 # Uncomment on the machine that holds the target service.
 # remote_target_addr = "192.168.1.50:22"
 
 #[telegram]
-#token = "123456:ABC-DEF…"   # THIS machine's bot token
+#token = "123456:ABC-DEF…"    # THIS machine's bot token
 #peer_bot_id = 987654321      # the PEER bot's numeric id
-# timeout_secs = 120         # optional; default 120
+#secret = "shared-secret"      # the shared secret for the readiness handshake
+#timeout_secs = 120            # optional; default 120

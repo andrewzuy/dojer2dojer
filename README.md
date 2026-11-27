@@ -5,6 +5,11 @@
 A small Rust CLI that lets two machines behind NATs reach each other's
 **private TCP services** — no ports to open, no relay server, no account.
 
+The flow is: **you pick who serves** (client/server, with a live setup screen),
+both sides discover their public addresses, exchange them automatically over
+Telegram (manual prompt as fallback), punch through the NATs, and keep the
+tunnel alive — re-negotiating automatically if it drops.
+
 Type one address into the other machine, and a normal TCP tool (`ssh`,
 `nc`, `curl`, …) works as if the two machines were on the same LAN.
 
@@ -43,11 +48,11 @@ makes the design work.
 ## Table of contents
 
 1. [How it works](#how-it-works)
-2. [The one rule: which side exposes the service](#the-one-rule-which-side-exposes-the-service)
+2. [Which side exposes the service](#which-side-exposes-the-service)
 3. [Requirements](#requirements)
-4. [Building](#building)
+4. [Getting a binary](#getting-a-binary) and [Building from source](#building-from-source)
 5. [Quick start (two machines, SSH to a home server)](#quick-start)
-6. [Automatic address exchange over Telegram](#automatic-address-exchange-over-telegram)
+6. [Telegram address exchange (the default)](#telegram-address-exchange-the-default)
 7. [Configuration reference](#configuration-reference-configtoml)
 8. [CLI reference](#cli-reference)
 9. [Examples](#examples)
@@ -61,35 +66,82 @@ makes the design work.
 
 ## How it works
 
-Everything below happens on **both** machines, in the same order, with no
-coordination beyond you typing an address into the other party's terminal:
+Everything below happens on **both** machines, in the same order. The setup
+screen appears first, then the exchange, and each side ends with the same
+story: **you pick who serves, the two sides prove they're up, discover their
+addresses, cross-check roles, punch, handshake, and tunnel — retrying
+automatically if it drops.**
 
-### 1. STUN discovery
+### 1. Startup setup
 
-A raw RFC 5389 **Binding Request** is sent from THE socket to each configured
-STUN server (manual implementation — no STUN crate, because the socket must
-stay under our control for the later phases). Each server gets up to 3 s, and
-the whole list is tried twice. The response's `XOR-MAPPED-ADDRESS` attribute
-tells us the public `ip:port` the rest of the internet sees for this socket.
+The app asks for three things — the role, the setting for that role, and the
+address-exchange channel — and validates them before anything else happens.
 
-### 2. Peer address exchange
+- **Role** (`client` | `server`): `--role` flag → `role` config key →
+  interactive prompt. The two sides must disagree (opposite roles); the
+  exchange below makes that enforceable.
+- **Setting** — the one thing this machine does with the tunnel:
+  - **client**: `127.0.0.1:<local_tcp_listen_port>` — the local port the
+    tunnel is offered on.
+  - **server**: `<remote_target_addr>` — the private service on this machine
+    that tunneled traffic is delivered to.
+- **Channel** — how the peer address is exchanged (Telegram or manual; see
+  below).
 
-Your public address is printed. Two ways to complete the exchange:
+The setting is validated at setup time (a reachable port number, a parseable
+`ip:port`), so a config mistake surfaces immediately — not after the punch.
 
-- **Manual (default):** share your address with the other person (chat, phone,
-  carrier pigeon) and type *their* address into the prompt. Input is validated
-  and re-prompted on bad input.
-- **Automatic over Telegram:** run with `--telegram` and a configured
-  `[telegram]` table, and the two bots DM each other their public addresses
-  instead — no copy/paste. See [Automatic address exchange over
-  Telegram](#automatic-address-exchange-over-telegram).
+### 2. Readiness handshake + STUN discovery (Telegram mode)
+
+1. **Readiness handshake.** Before anything is sent, each bot sends the peer
+   a `PTUN READY <secret>` line — and a `PTUN ROLE <client|server>` line
+   declaring its role — and waits for the peer's. This proves the peer bot
+   is up and listening *before* anything else; the shared secret is the only
+   cross-machine credential the handshake needs. Any failure here falls back
+   to the manual prompt.
+2. **STUN discovery.** A raw RFC 5389 **Binding Request** is sent from THE
+   socket to each configured STUN server (manual implementation — no STUN
+   crate, because the socket must stay under our control for the later
+   phases). Each server gets up to 3 s, and the whole list is tried twice.
+   The response's `XOR-MAPPED-ADDRESS` attribute tells us the public
+   `ip:port` the rest of the internet sees for this socket.
+
+Manual mode (`--manual`, or no usable `[telegram]` table) skips the handshake
+and goes straight to STUN.
+
+### 3. Peer address exchange — announce + wait
+
+When a usable `[telegram]` table is configured, the two sides exchange
+addresses automatically — **no copy/paste**:
+
+1. Each bot announces its public address as `PTUN v1 <ip:port>` to the peer
+   bot.
+2. Each side waits for the peer's announcement (bounded by `timeout_secs`,
+   default 120 s). A stale line older than 10 minutes is ignored, and the
+   own-echo is dropped, so nothing re-processed or replayed is accepted.
+3. If the timeout fires or Telegram is unreachable, the app logs the reason
+   and drops back to the **manual prompt** (type the peer's address).
+
+Manual mode — `--manual`, or no usable table — is the unchanged fallback:
+each side prints its address, you exchange them out-of-band, and each enters
+the other's into the prompt (validated, re-prompted on bad input).
 
 > **Addresses are session-scoped.** The port (and sometimes the IP) changes
 > every time the process runs, and the NAT mapping goes away when the process
 > exits or the binding expires. There is no persistent "tunnel address" —
 > exchange a fresh address for every session.
 
-### 3. UDP hole punching
+### 4. Role cross-check (Telegram mode)
+
+As part of the readiness handshake each side declared its role. After the
+address exchange, the app cross-checks the two declarations: if they disagree
+— the same role on both sides, which can never tunnel — the app says so
+loudly (`role misconfiguration: …`) and stops *at startup*, re-selecting the
+setup screen instead of silently burning a punch cycle. A matching pair
+proceeds. The choice of role is never derived from addresses — you picked it
+at setup, and the cross-check makes sure both sides meant the same thing.
+
+### 5. UDP hole punching
 
 Both sides repeatedly send a small UDP packet (a random 8-byte session
 nonce) to the peer's public address, every `punch_interval_ms`
@@ -99,22 +151,7 @@ ignored. Packets are sent for up to `punch_timeout_secs` (default 30 s).
 Because both sides punch at the same time, typical cone NATs open within a
 few seconds of both processes starting.
 
-### 4. Deterministic role negotiation
-
-QUIC needs one peer to *listen* (server) and one to *dial* (client). To avoid
-any extra signaling, both sides run the **same pure function** on the two
-public addresses:
-
-- lower public IP → **server** role (hosts the QUIC endpoint)
-- higher public IP → **client** role (dials in)
-- all IPv4 addresses sort before IPv6 (the socket is IPv4-only in this MVP,
-  so this rarely matters)
-- same IP (local testing) → lower port wins
-
-The function always returns *opposite* roles on each side, so both machines
-agree on who is who without talking.
-
-### 5. Self-signed certificate + QUIC handshake
+### 6. Self-signed certificate + QUIC handshake
 
 A fresh **ECDSA P-256 self-signed certificate** (CN `p2p-tunnel`) is
 generated in memory once the role is known. The server presents it; the client accepts
@@ -126,7 +163,7 @@ fingerprint.
 The punched UDP socket is then handed to quinn, which takes ownership and
 performs the TLS 1.3 / QUIC handshake over it.
 
-### 6. TCP↔QUIC stream bridge
+### 7. TCP↔QUIC stream bridge
 
 - **Client role:** a local TCP listener on `127.0.0.1:<local_tcp_listen_port>`
   accepts connections. Each accepted connection gets its **own bidirectional
@@ -141,50 +178,57 @@ sees its own EOF. (This is what makes patterns like `echo x | ssh host cat`
 work instead of dying.) If the server's target is unreachable, the client
 sees a clean EOF rather than hanging.
 
-When the QUIC connection drops, everything shuts down cleanly and the process
-exits — re-run both sides to make a new tunnel (no automatic reconnect yet).
+### Reconnect behavior
+
+The tunnel is a **reconnect supervisor**, not a one-shot process. When the
+QUIC connection drops — or a STUN/punch/handshake step fails after the tunnel
+starts — the supervisor backs off (2 s, 4 s, 8 s … capped at 30 s, full jitter, and
+the backoff clock resets if the tunnel stayed up at least 30 s) and re-negotiates
+everything from scratch: fresh STUN, fresh exchange, fresh punch, fresh
+handshake, fresh tunnel. Each attempt gets a new NAT mapping and a new peer
+address — nothing is reused. The escalation status line (`tunnel dropped —
+retrying in …`) explains what is happening without interrupting the pane.
+
+User abort (`q` / Esc / Ctrl-C) always exits cleanly. Setup errors and
+structural errors (e.g. the port is already in use) exit with a non-zero
+code and an actionable hint.
 
 ---
 
-## The one rule: which side exposes the service
+## Which side exposes the service
 
-This is the part that surprises first-time users, so read it before you
-configure:
+Roles are now **user-selected**, not derived from addresses, so the direction
+is exactly what you configured:
 
-> **The machine with the *lower* public IP becomes the *server* role — and it
-> is the server role that forwards traffic to `remote_target_addr`.**
->
-> In other words: **tunneled traffic is always delivered to the machine with
-> the lower public IP.** The other machine (higher IP) is the one that gets
-> the local convenience port (`127.0.0.1:<local_tcp_listen_port>`).
+- The **client** side offers the local port: anything dialed to
+  `127.0.0.1:<local_tcp_listen_port>` on that machine is forwarded to the
+  peer's target.
+- The **server** side exposes the private service: anything tunneled arrives
+  at `remote_target_addr` on that machine.
 
-Consequences:
+The two sides must choose **opposite** roles. The app enforces this at startup
+(in Telegram mode it cross-checks the peer's declared role and refuses to
+proceed on a conflict), so both sides always agree on who serves — there is
+no longer an "it depends on the public IP order" surprise.
 
-- To reach a service on your home box from a laptop, the **home box needs the
-  lower public IP**. You can check before committing: each run prints its
-  public address in step 1, and the role is logged right after the punch.
-- If the ordering comes out the other way, the tunnel still works — it just
-  exposes *the other machine's* target service. Reconfigure your goal to
-  match the direction (or see [Limitations](#limitations) — role override is
-  a known future item).
-
-**Tip that removes most of the fiddling:** put *both* keys in *every*
-machine's config — `local_tcp_listen_port` (the port *this* machine will
-offer) and `remote_target_addr` (the private service *on this* machine).
-Each side only reads the key that matches the role it happens to get, so you
-don't have to predict which role you'll be.
+**Tip that removes the fiddling:** put both keys in *every* machine's config —
+`local_tcp_listen_port` (the port this machine will offer) and
+`remote_target_addr` (the private service on this machine). Each side only
+reads the key matching its chosen role, so you never need to predict which
+role you'll get — you choose it at the setup screen.
 
 ---
 
 ## Requirements
 
 - **Rust** (edition 2024; tested with cargo 1.93) — or grab a
-  [CI-built static Linux binary](#building)
+  [CI-built static Linux binary](#getting-a-binary)
 - **Outbound UDP** to a STUN server (default config uses Google/Cloudflare)
   and to the peer's public address
 - **Two machines whose NATs are not symmetric** (see
   [Limitations](#limitations))
-- For real use: a way to compare the two addresses out-of-band (any chat)
+- For real use: a way to compare the two certificate fingerprints out-of-band
+  (any chat) — the one comparison the tunnel does not automate
 
 ## Getting a binary
 
@@ -248,7 +292,9 @@ SSH — no router config, no public IP requirement, no relay.
 
 ### Step 2 — write the config on both machines
 
-**Home box** (`config.toml`):
+Pick the roles first (both sides must be opposite), then write the config.
+
+**Home box** — exposes SSH (server role):
 
 ```toml
 stun_servers = [
@@ -256,15 +302,13 @@ stun_servers = [
     "stun.cloudflare.com:3478",
 ]
 
-# This machine's local port, used if THIS machine ends up the client role.
-local_tcp_listen_port = 12345
+role = "server"
 
-# The private service on THIS box to expose (used if THIS machine ends up
-# the server role). Here: SSH on loopback.
+# The private service on THIS box to expose. Here: SSH on loopback.
 remote_target_addr = "127.0.0.1:22"
 ```
 
-**Laptop** (`config.toml`):
+**Laptop** — consumes the tunnel (client role):
 
 ```toml
 stun_servers = [
@@ -272,18 +316,16 @@ stun_servers = [
     "stun.cloudflare.com:3478",
 ]
 
+role = "client"
+
 # The port the laptop will offer, e.g. ssh -p 12345 user@127.0.0.1
 local_tcp_listen_port = 12345
-
-# A valid private target reachable FROM THE LAPTOP — only ever read if the
-# laptop turns out to be the server role (i.e. the laptop has the lower
-# public IP). Point it at something harmless on your LAN.
-remote_target_addr = "192.168.1.50:8080"
 ```
 
-(See [The one rule](#the-one-rule-which-side-exposes-the-service) for why the
-laptop needs a `remote_target_addr` at all, and [Configuration
-reference](#configuration-reference-configtoml) for every key.)
+(Role can also be set per-run with `--role`, overriding the config key. If
+neither is given, you get the role picker at startup.
+See [Which side exposes the service](#which-side-exposes-the-service) and the
+[Configuration reference](#configuration-reference-configtoml) for every key.)
 
 ### Step 3 — run on both machines
 
@@ -294,8 +336,10 @@ reference](#configuration-reference-configtoml) for every key.)
 ./target/release/p2p-tunnel
 ```
 
-Each prints its public address; exchange them and type each one into the
-other's prompt:
+Each machine shows the setup screen (role + setting + channel). With a
+usable `[telegram]` table the address exchange is automatic — no flag needed.
+With `--manual` (or no usable table) each machine prints its public address;
+exchange them out-of-band and enter each one into the other's prompt:
 
 ```text
 # home box                                        # laptop
@@ -309,25 +353,28 @@ Enter peer's public address (ip:port):            Enter peer's public address (i
 ### Step 4 — watch both sides connect
 
 Within seconds (usually well under the 30 s punch timeout) both sides log
-success. **Check the role lines** — the home box must be the *server*:
+success. The log is the same story on both machines:
 
 ```text
-# home box (server role)
-  hole punched: packet received from peer  elapsed_ms=1412  sent=3
-  role = server
-  generated self-signed certificate …  fingerprint=9f2c…ab
-  QUIC endpoint ready
-  waiting for the peer's QUIC connection…
-  QUIC connection accepted
-  tunnel server ready — forwarding incoming QUIC streams to 127.0.0.1:22
+role selected — setup complete                 # role + setting + channel
+discovered public address: 93.184.216.34:51000
+exchanging readiness with the peer bot over Telegram…   # Telegram mode
+hole punched: packet received from peer  elapsed_ms=1412  sent=3
+QUIC endpoint ready
+QUIC connection established            # client
+QUIC connection accepted                # server
+tunnel is up — traffic is flowing
+```
 
+When the tunnel is up, both sides log the certificate fingerprint and the
+local listener line (the client) / the target (the server):
+
+```text
 # laptop (client role)
-  hole punched: packet received from peer  elapsed_ms=1873  sent=4
-  role = client
-  generated self-signed certificate …  fingerprint=9f2c…ab   ← compare with home box
-  QUIC endpoint ready
-  QUIC connection established
   tunnel client listening — connect to 127.0.0.1:12345 (e.g. ssh -p 12345 user@127.0.0.1)
+
+# home box (server role)
+  tunnel server ready — forwarding incoming QUIC streams to 127.0.0.1:22
 ```
 
 (If the fingerprints match what the other side printed, you've also done an
@@ -346,23 +393,31 @@ window works concurrently.
 
 ### Step 6 — tear down
 
-`Ctrl-C` on either side; both processes exit. The tunnel is gone; next
-session, repeat from step 3 (addresses change every run).
+`Ctrl-C` / `q` / `Esc` on either side; both processes exit. The tunnel is
+gone; next session, repeat from step 3 (addresses change every run).
+
+If the tunnel drops on its own (NAT timeout, network flap, or a restart on
+one side), the supervisor re-negotiates automatically — you don't repeat
+steps — and only a terminal condition (e.g. setup errors) exits non-zero.
 
 ---
 
-## Automatic address exchange over Telegram
+## Telegram address exchange (the default)
 
-The manual "type the address" prompt is the default and always works. If you'd
-rather not copy/paste between two terminals, both machines can exchange
-addresses automatically using Telegram's [bot-to-bot](https://core.telegram.org/api/bots/bot-to-bot)
-capability — each side's bot DMs the other side's bot a self-describing
-`PTUN v1 <ip:port>` message, and each waits for the peer's to arrive.
+When a usable `[telegram]` table is configured — a token, a peer bot id and a
+shared secret — both machines exchange addresses automatically using
+Telegram's [bot-to-bot](https://core.telegram.org/api/bots/bot-to-bot)
+capability. Each side's bot DMs the other side's bot:
 
-This is **optional**: nothing changes unless you add the `[telegram]` table
-*and* pass `--telegram`. The manual prompt remains the fallback whenever
-`--telegram` isn't set, the table is missing, the token is invalid, or the
-wait times out.
+- `PTUN READY <secret>` at startup (before STUN) — proves the peer bot is up
+- `PTUN ROLE <client|server>` — declares the role, cross-checked by the peer
+- `PTUN v1 <ip:port>` — the public address, sent after STUN
+
+This is **the default**, not an opt-in. The manual prompt remains the fallback
+whenever Telegram is unusable — no `[telegram]` table, an incomplete one, a
+bad token, a peer bot that isn't answering, or a timeout. `--manual` (alias
+`--no-telegram`) forces the manual prompt; `--telegram` validates and errors
+early on a missing table.
 
 ### Set it up
 
@@ -374,26 +429,31 @@ wait times out.
 3. Get each bot's **numeric id** (BotFather can show it, or any `@id` bot on
    the bot's profile).
 4. In each machine's `config.toml`, add a `[telegram]` table with **this
-   machine's** token and the **peer bot's** id:
+   machine's** token, the **peer bot's** id, and a shared secret both
+   operators must agree on:
 
    ```toml
    [telegram]
    token = "123456:ABC-DEF…"   # THIS machine's bot token
    peer_bot_id = 987654321      # the PEER bot's numeric id
-   # timeout_secs = 120         # optional; default 120
+   secret = "shared-secret"      # must match the peer's config
+   # timeout_secs = 120        # optional; default 120
    ```
 
    The two tables point at each other: machine A's `peer_bot_id` is bot B's
-   id, and machine B's `peer_bot_id` is bot A's id.
-5. Run both sides with the flag:
+   id, and machine B's `peer_bot_id` is bot A's id. The `secret` goes in both
+   configs unchanged — it travels to the peer in the `PTUN READY` line and is
+   how each side proves the peer is up and means the same thing.
+5. Run both sides:
 
    ```sh
-   ./p2p-tunnel --telegram
+   ./p2p-tunnel
    ```
 
-   Each side sends its address and waits (up to `timeout_secs`) for the
-   peer's. On success it proceeds straight to hole punching; on timeout or
-   error it logs the reason and drops back to the manual prompt.
+   The exchange happens automatically — no flag needed. Each side announces
+   its address and waits (up to `timeout_secs`) for the peer's. On success it
+   proceeds straight to hole punching; on timeout or error it logs the
+   reason and drops back to the manual prompt.
 
 ### How it stays loop-safe and stale-safe
 
@@ -416,9 +476,11 @@ is already queued. This implementation prevents both:
   started before us is still accepted.
 
 The payload format is `PTUN v1 <ip:port>`; anything not matching that prefix
-is ignored. Role negotiation (server vs client) is unchanged and still
-computed locally from the two addresses — Telegram only carries the addresses
-themselves.
+is ignored. **Roles are not negotiated over Telegram** — you pick yours at
+setup, and the peer's `PTUN ROLE` line is cross-checked against it. A conflict
+(both sides picked the same role, which can never tunnel) is fatal at startup:
+the app refuses to proceed rather than burn a punch cycle and fail silently.
+Telegram only carries liveness, the role declaration, and the address.
 
 ## Configuration reference (`config.toml`)
 
@@ -429,17 +491,20 @@ typing a key name wrong won't error out, so copy the shipped sample.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `stun_servers` | `["host:port", …]` | *(required, non-empty)* | STUN servers tried in order (hostnames OK, port defaults to 19302 if omitted). Each gets up to 3 s; the whole list is tried twice. |
+| `role` | `"client"` \| `"server"` | unset | **This machine's role** (v2). Optional: the `--role` flag wins over this key; when both are absent, the role is selected at the setup screen. The two sides must pick opposite roles — a conflict is fatal at startup. |
 | `punch_interval_ms` | `u64` | `500` | Milliseconds between outbound hole-punch packets. |
 | `punch_timeout_secs` | `u64` | `30` | Give up on hole punching after this long (the error includes how many packets were sent). |
 | `keep_alive_interval_secs` | `u64` | `5` | Seconds between QUIC keep-alive PING packets sent while the tunnel is idle. Idle NAT devices drop the port mapping of a silent connection, so these small PINGs keep the tunnel alive; `0` disables keep-alive (the tunnel then dies after the NAT's idle timeout, typically a few minutes). |
-| `local_tcp_listen_port` | `u16` | unset | **Read only if this machine gets the client role.** The `127.0.0.1` port that offers the tunnel (e.g. `12345`). Loopback only — never exposed to your LAN. |
-| `remote_target_addr` | `"ip:port"` | unset | **Read only if this machine gets the server role.** The private TCP target on *this* machine's network that tunneled traffic is delivered to (e.g. `"127.0.0.1:22"`). |
-| `[telegram].token` | `string` | unset | **Only used with `--telegram`.** This machine's bot API token. The whole `[telegram]` table is optional and ignored unless the flag is passed. |
-| `[telegram].peer_bot_id` | `i64` | unset | The **peer bot's** numeric id — the `chat_id` its `PTUN` address message is sent to. |
+| `local_tcp_listen_port` | `u16` | unset | **Read only if this machine is the client.** The `127.0.0.1` port that offers the tunnel (e.g. `12345`). Loopback only — never exposed to your LAN. |
+| `remote_target_addr` | `"ip:port"` | unset | **Read only if this machine is the server.** The private TCP target on *this* machine's network that tunneled traffic is delivered to (e.g. `"127.0.0.1:22"`). |
+| `[telegram].token` | `string` | unset | **This machine's bot API token.** Present in any usable `[telegram]` table; without it the exchange falls back to manual. |
+| `[telegram].peer_bot_id` | `i64` | unset | The **peer bot's** numeric id — the `chat_id` its `PTUN` messages are sent to. |
+| `[telegram].secret` | `string` | unset | The shared secret for the readiness handshake (`PTUN READY`). Both sides must use the same value; without it the table is treated as unusable and the exchange falls back to manual. |
 | `[telegram].timeout_secs` | `u64` | `120` | How long to wait for the peer bot's address before falling back to the manual prompt. |
 
-The shipped sample `config.toml` (in the repo root) has both role keys and
-the `[telegram]` table commented out with instructions; copy it and edit.
+The shipped sample `config.toml` (in the repo root) has the `role` key,
+both side keys, and the `[telegram]` table commented out with instructions;
+copy it and edit.
 
 ## CLI reference
 
@@ -447,15 +512,20 @@ the `[telegram]` table commented out with instructions; copy it and edit.
 p2p-tunnel [OPTIONS]
 
 Options:
-      --config <CONFIG>  Path to the TOML config file [default: ./config.toml]
-      --telegram         Negotiate the peer address via Telegram bot-to-bot
-                         (requires a `[telegram]` table in the config); falls
-                         back to the manual prompt on timeout/error
-      --tui              Show the live terminal UI (auto-enabled on a TTY)
-      --no-tui           Force the plain log output, even on a TTY
-      --verbose          Enable debug logging (RUST_LOG takes precedence if set)
-  -h, --help             Print help
-  -V, --version          Print version
+      --config <CONFIG>   Path to the TOML config file [default: ./config.toml]
+      --role <ROLE>       This machine's role: client | server
+                         (wins over the `role` config key; if neither is
+                         set, you get the setup-screen picker)
+      --telegram          Force Telegram address exchange (requires a usable
+                         `[telegram]` table; errors early otherwise). This is
+                         the default when a usable table is configured.
+      --manual            Force the manual "type the peer address" prompt
+                         (alias: --no-telegram) — opts out of the default
+      --tui               Show the live terminal UI (auto-enabled on a TTY)
+      --no-tui            Force the plain log output, even on a TTY
+      --verbose           Enable debug logging (RUST_LOG takes precedence if set)
+  -h, --help              Print help
+  -V, --version           Print version
 ```
 
 **Live TUI.** When stdout is a real terminal the app runs a full-screen UI
@@ -481,17 +551,23 @@ Options:
 
 The stepper fills in as each phase completes (✓ done, animated spinner
 active, · pending, ✗ error), the connection panel shows both public
-addresses, the chosen role, and the fresh cert fingerprint, and the events
-panel is a scrolling log. The header turns green on `CONNECTED` and red on
-error (which also fills the events panel). Press **`q`** or **Esc** to
-abort; when a `[telegram]` table is configured, **`t`** toggles between
-Telegram and manual address exchange at any time (the status line shows the
-current mode). It's auto-enabled only when stdout is a TTY — when piped or redirected
-the original plain logging is used, and `--no-tui` forces that path while
+addresses, the chosen role, the exchange mode, the configured port/target,
+and the fresh cert fingerprint, and the events panel is a scrolling log.
+The header turns green on `CONNECTED` and red on error (which also fills
+the events panel). Press **`q`** or **Esc** to abort; when a `[telegram]`
+table is configured, **`t`** toggles between Telegram and manual address
+exchange at any time (the status line shows the current mode). It's
+auto-enabled only when stdout is a TTY — when piped or redirected the
+original plain logging is used, and `--no-tui` forces that path while
 `--tui` forces the UI (handy for testing). When the TUI is active, `tracing`
 logging is silenced so the stderr formatter never interleaves with the
 alternate screen; the TUI is the single source of truth. `RUST_LOG` is
 ignored in that case (the TUI is the output).
+
+The startup setup screen (role + setting + channel) runs first: pick the
+role, fill the setting, and hit Enter to validate. Fatal errors and a
+role conflict both re-open the screen — the operator always lands on a
+valid, mutually-consistent selection before the run proceeds.
 
 Logging levels (non-TUI path): `info` by default (the lines shown in the
 quick start), `--verbose` or `RUST_LOG=debug` for per-packet/per-round
@@ -507,9 +583,9 @@ On success the process exits 0 when the tunnel ends; on failure it prints
 
 ### SSH to a home server (the canonical use case)
 
-As in the [quick start](#quick-start): laptop's `config.toml` has
-`local_tcp_listen_port = 12345`, home box has
-`remote_target_addr = "127.0.0.1:22"`, then on the laptop:
+As in the [quick start](#quick-start): laptop's `config.toml` has the
+`client` role and `local_tcp_listen_port = 12345`, the home box has the
+`server` role and `remote_target_addr = "127.0.0.1:22"`, then on the laptop:
 
 ```sh
 ssh -p 12345 user@127.0.0.1
@@ -523,12 +599,12 @@ Works with any SSH option: `scp -P 12345 user@127.0.0.1:/path/file .`,
 Expose a private HTTP server, a game port, a database, anything:
 
 ```toml
-# machine with the lower public IP (server role)
+# server role — exposes the service
 remote_target_addr = "192.168.1.20:8080"
 ```
 
 ```sh
-# other machine (client role, local_tcp_listen_port = 18080)
+# client role, local_tcp_listen_port = 18080
 curl http://127.0.0.1:18080/
 nc 127.0.0.1 18080
 ```
@@ -581,11 +657,15 @@ Read this before using it anywhere sensitive.
   path where they can intercept your UDP flow could in principle terminate
   and re-wrap it. This is an explicit PoC trade-off, not an oversight.
 - **Mitigation: fingerprint comparison.** Both sides log the SHA-256
-  fingerprint of the certificate in use at startup (the line shown in the
-  quick start). Compare them out-of-band — the same way you'd compare an SSH
+  fingerprint of the certificate in use at session start (the line shown in
+  the quick start). Compare them out-of-band — the same way you'd compare an SSH
   host key — and a MITM is detected.
 - **The local listener is loopback-only** (`127.0.0.1`), so devices on your
   LAN can't reach the tunnel port directly.
+- **Secrets travel only in the exchange path** — the shared secret used in the
+  readiness handshake is a config value, and only the two bot-to-bot channels
+  see it; the public address travels as a `PTUN v1` line whose payload is
+  just `ip:port`. The rest of the exchange carries no keys.
 - **Planned hardening:** certificate fingerprint pinning (a shared
   out-of-band secret checked automatically). Until that lands, treat this as
   a tunnel between two *known, mutually trusted* peers — like an ad-hoc SSH
@@ -598,10 +678,11 @@ Read this before using it anywhere sensitive.
 | `STUN discovery failed` | No internet, outbound UDP blocked, or **CGNAT** (carrier-grade NAT — the "public" address the carrier assigns can't receive inbound traffic) | Check connectivity / firewall. If you're on a mobile hotspot or CGNAT, this MVP can't traverse that (TURN fallback is planned). Try the other network. |
 | `hole punching timed out after …s (sent N punch packets)` | Stale peer address (their NAT binding expired or their process restarted), or one side behind a **symmetric NAT** | Re-run *both* sides and exchange fresh addresses within the same session. If one side is on a mobile hotspot, expect failure (symmetric NAT). |
 | Punch succeeds, then `QUIC handshake` error | Middlebox interference, or the peer process exited mid-handshake | Retry on both sides. If persistent, a middlebox may be mangling the flow. |
-| `… is required for the … role` error at startup | Your config is missing the key for the role this machine got | Add `remote_target_addr` (server role) or `local_tcp_listen_port` (client role) — easiest: set **both** in every config, per the [tip](#the-one-rule-which-side-exposes-the-service). |
+| `… is required for the … role` error at startup | Your config is missing the key for the role you picked | Add `remote_target_addr` (server role) or `local_tcp_listen_port` (client role) — easiest: set **both** in every config, per the [tip](#which-side-exposes-the-service). |
+| `role misconfiguration: …` at startup | Both sides picked the same role (e.g. both `client`) — a tunnel can never work | Fix one side's role (`--role` or the `role` key) and re-run; the setup screen reopens with the conflict shown. |
 | Tunnel up, but the target connection dies instantly (client sees EOF) | `remote_target_addr` isn't reachable from the server machine | Test locally on the server machine (`nc 127.0.0.1 22`); fix the target, then re-run. The server logs a `cannot reach target; closing stream` warning. |
 | `bind local TCP listener … (is the port already in use?)` | The local port is taken by another process (or a zombie previous run) | Pick another `local_tcp_listen_port`, or kill the old process. |
-| It worked once and never again | NAT bindings / public addresses are ephemeral; some NATs age out mappings quickly | Always start both sides fresh and exchange fresh addresses per session. |
+| It worked once and never again | NAT bindings / public addresses are ephemeral; some NATs age out mappings quickly | The supervisor retries automatically — the tunnel re-negotiates on its own. If it never recovers, stale config or a dead peer is the likely cause: fix that, then re-run. |
 
 General debug moves:
 
@@ -609,22 +690,22 @@ General debug moves:
   packet, each STUN round, and exactly where things stop.
 - `RUST_LOG=trace` on one side for maximum noise.
 - Confirm the **role lines** point the tunnel the direction you expect (see
-  [The one rule](#the-one-rule-which-side-exposes-the-service)).
+  [Which side exposes the service](#which-side-exposes-the-service)).
 
 ## Limitations
 
 - **IPv4 only** for the punched socket (`0.0.0.0` bind). IPv6 would need no
   punching at all — it's a future item.
-- **Direction is fixed by address order**: traffic always lands on the
-  machine with the lower public IP (no manual role override yet).
+- **One tunnel per run.** The supervisor re-negotiates automatically, but the
+  process itself is single-flight: it runs one tunnel at a time, and there is
+  no persistent signaling channel across restarts — each session re-exchanges
+  addresses. Multiplexing refinements are future work.
+- **No persistent signaling.** Addresses are session-scoped; after a process
+  restart, re-run both sides (the supervisor handles in-process drops, not
+  fresh pairings).
 - **Simultaneous hole punching works best against *cone* NATs.** Symmetric
   NATs / CGNAT (common on mobile hotspots) will typically fail the punch
   within the timeout — a TURN relay fallback is on the roadmap.
-- **One tunnel per run.** No reconnect: if the QUIC connection drops or a
-  machine restarts, re-run both sides. Address exchange is manual by default
-  (or automatic via the optional Telegram bot-to-bot channel), but there is no
-  persistent signaling or re-handshake once a tunnel is down. Multiplexing
-  refinements and resilience are future work.
 - **One listen port and one target per side** (though concurrent
   *connections* through them are fully supported).
 - **MVP trust model** (accept-any cert) — see [Security model](#security-model).
@@ -633,22 +714,24 @@ General debug moves:
 
 ```sh
 cargo build                # compile
-cargo test                 # 46 tests (42 unit + 4 integration)
+cargo test                 # ~109 tests (105 unit + 4 integration)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo run -- --verbose     # run with debug logging
 ```
 
 **Tests** cover STUN encode/parse (incl. edge cases: unknown attrs, wrong
-transaction IDs, v4/v6), punch timing/filtering/timeout, role symmetry
-(exhaustive over mixed v4/v6 address sets), cert/fingerprint construction,
-the bridge's copy + half-close semantics (via in-memory `tokio::io`
-streams), and — as integration tests — the full Telegram exchange against a
-local mock Bot API (`tests/telegram/mock_bot_api.py`, including stale-
-backlog rejection) plus TUI prompt round-trips through the event channel. By
-project decision there is deliberately **no loopback test of the QUIC
-server+client path** (one machine playing both roles is ambiguous); the real
-handshake is validated in two-machine tests.
+transaction IDs, v4/v6), punch timing/filtering/timeout, role validity and
+cross-check symmetry, cert/fingerprint construction, the bridge's copy +
+half-close semantics (via in-memory `tokio::io` streams), setup validation
+(role flag precedence, setting validation, exchange-mode resolution), and
+the supervisor's retry/backoff decisions, and — as integration tests — the
+full Telegram exchange against a local mock Bot API (`tests/telegram/mock_bot_api.py`,
+including stale-backlog rejection and the READY/ROLE handshake) plus TUI
+prompt round-trips through the event channel. By project decision there is
+deliberately **no loopback test of the QUIC server+client path** (one machine
+playing both roles is ambiguous); the real handshake is validated in
+two-machine tests.
 
 **CI** (`.github/workflows/ci.yml`) runs on every push/PR: lint (fmt + clippy
 `-D warnings`), release build + tests on a Linux/macOS/Windows matrix, and a
@@ -676,17 +759,19 @@ probe client.
 │   ├── telegram/mock_bot_api.py  # mock Telegram Bot API server for the exchange test
 │   └── nat-sim/               # Phase 12 helpers: fake STUN/NAT, echo target, probe client
 └── src/
-    ├── main.rs                # the full pipeline, one reused UDP socket, error hints
+    ├── main.rs                # boot, wiring, error hints
+    ├── supervisor.rs          # reconnect supervisor: one attempt = exchange → STUN → cross-check → punch → QUIC → tunnel
+    ├── setup.rs               # startup setup: role/setting/channel resolution + validation
     ├── config.rs              # Config::load (serde/toml)
     ├── cli.rs                 # clap CLI + peer-address prompt/parsing
     ├── stun.rs                # manual RFC 5389 client (encode/parse/discover)
     ├── punch.rs               # hole punching loop
-    ├── role.rs                # deterministic server/client decision
+    ├── role.rs                # role validity + cross-check symmetry
     ├── quic.rs                # certs, verifier, endpoint, connect/accept
     ├── tunnel.rs              # TCP↔QUIC bridges (client + server sides)
-    ├── telegram.rs            # optional Telegram bot-to-bot address exchange
-    ├── tui.rs                 # ratatui/crossterm render loop, inline prompt editor
-    └── tui_state.rs           # TUI state (phases, logs) shared via an event channel
+    ├── telegram.rs            # Telegram bot-to-bot signaling (READY + ROLE + address)
+    ├── tui.rs                 # ratatui/crossterm render loop, setup screen, inline prompt editor
+    └── tui_state.rs           # TUI state (phases, logs, setup form) shared via an event channel
 ```
 
 `tests/` is the cargo integration-test directory; `tests/nat-sim/` and
